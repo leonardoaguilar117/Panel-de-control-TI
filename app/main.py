@@ -739,3 +739,596 @@ def ver_adjunto(nombre: str, _=Depends(usuario_actual)):
     )
 
 
+# --------------------------------------------------------------------------
+# Catalogos
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/catalogos")
+def catalogos(db: Session = Depends(obtener_sesion), _=Depends(usuario_actual)):
+    return {
+        "sucursales": [
+            {"id": s.id, "nombre": s.nombre, "clave": s.clave}
+            for s in db.query(Sucursal).filter_by(activo=True).order_by(Sucursal.nombre)
+        ],
+        "departamentos": [
+            {"id": d.id, "nombre": d.nombre, "clave": d.clave}
+            for d in db.query(Departamento).filter_by(activo=True).order_by(Departamento.nombre)
+        ],
+        "bodegas": [
+            {"id": b.id, "nombre": b.nombre, "sucursal_id": b.sucursal_id}
+            for b in db.query(Bodega).filter_by(activo=True).order_by(Bodega.nombre)
+        ],
+        "plantas": [
+            {"id": p.id, "nombre": p.nombre}
+            for p in db.query(Planta).filter_by(activo=True).order_by(Planta.nombre)
+        ],
+        "cuentas_licencia": [
+            {
+                "id": c.id,
+                "nombre": c.nombre,
+                "producto": c.producto,
+                "correo_cuenta": c.correo_cuenta,
+                "referencia_credencial": c.referencia_credencial,
+                "ranuras_totales": c.ranuras_totales,
+                "ranuras_usadas": db.query(DetalleLicencia).filter_by(cuenta_id=c.id).count(),
+                "fecha_renovacion": c.fecha_renovacion,
+                "notas": c.notas,
+            }
+            for c in db.query(CuentaLicencia).filter_by(activo=True).order_by(CuentaLicencia.nombre)
+        ],
+        "sistemas": [
+            {
+                "id": s.id,
+                "nombre": s.nombre,
+                "clave": s.clave,
+                "descripcion": s.descripcion,
+                "orden": s.orden,
+            }
+            for s in db.query(SistemaInterno)
+            .filter_by(activo=True)
+            .order_by(SistemaInterno.orden, SistemaInterno.nombre)
+        ],
+        "analistas": [
+            {"id": u.id, "nombre": u.nombre, "username": u.username, "rol": u.rol.value}
+            for u in db.query(Usuario)
+            .filter(Usuario.activo.is_(True))
+            .order_by(Usuario.nombre)
+        ],
+        "tipos_activo": [t.value for t in TipoActivo],
+        "estatus_activo": [e.value for e in EstatusActivo],
+    }
+
+
+@app.post("/api/catalogos/{entidad}")
+def crear_catalogo(
+    entidad: str,
+    datos: schemas.CatalogoIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    modelos = {
+        "sucursales": Sucursal,
+        "departamentos": Departamento,
+        "bodegas": Bodega,
+        "plantas": Planta,
+    }
+    if entidad not in modelos:
+        raise HTTPException(404, "Catálogo desconocido")
+
+    Modelo = modelos[entidad]
+    kwargs: dict = {"nombre": datos.nombre.strip().upper()}
+    if entidad in ("sucursales", "departamentos"):
+        if not datos.clave:
+            raise HTTPException(400, "La clave es obligatoria")
+        kwargs["clave"] = datos.clave.strip().upper()
+    if entidad == "bodegas":
+        kwargs["sucursal_id"] = datos.sucursal_id
+
+    registro = Modelo(**kwargs)
+    db.add(registro)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Ya existe un registro con ese nombre o clave")
+    registrar(db, usuario, "CREAR", entidad, registro.id, datos.nombre)
+    db.commit()
+    return {"id": registro.id, "nombre": registro.nombre}
+
+
+# Tope de licencias por familia según el plan de cada producto
+LICENCIAS_POR_FAMILIA = {TipoActivo.LICENCIA_MICROSOFT: 6, TipoActivo.LICENCIA_NORTON: 10}
+NOMBRE_PRODUCTO = {TipoActivo.LICENCIA_MICROSOFT: "Microsoft 365", TipoActivo.LICENCIA_NORTON: "Norton 360"}
+
+
+def tipo_de_producto(producto: str | None) -> TipoActivo | None:
+    texto = (producto or "").lower()
+    if "norton" in texto:
+        return TipoActivo.LICENCIA_NORTON
+    if "microsoft" in texto or "365" in texto or "office" in texto:
+        return TipoActivo.LICENCIA_MICROSOFT
+    return None
+
+
+def validar_ranuras(datos: schemas.CuentaLicenciaIn, en_uso: int = 0) -> None:
+    tipo = tipo_de_producto(datos.producto)
+    if tipo and datos.ranuras_totales > LICENCIAS_POR_FAMILIA[tipo]:
+        raise HTTPException(
+            400,
+            f"Una familia de {NOMBRE_PRODUCTO[tipo]} admite hasta "
+            f"{LICENCIAS_POR_FAMILIA[tipo]} licencias",
+        )
+    if datos.ranuras_totales < en_uso:
+        raise HTTPException(
+            409, f"La familia ya tiene {en_uso} licencias; no puede quedar con menos ranuras"
+        )
+
+
+def validar_cupo_familia(db: Session, activo: Activo, tipo: TipoActivo, cuenta_id: int) -> None:
+    """Impide ligar una licencia a una familia llena o de otro producto."""
+    cuenta = db.get(CuentaLicencia, cuenta_id)
+    if cuenta is None:
+        raise HTTPException(404, "Familia de licencias no encontrada")
+    producto = tipo_de_producto(cuenta.producto)
+    if producto and producto != tipo:
+        raise HTTPException(
+            409, f"{cuenta.nombre} es una familia de {NOMBRE_PRODUCTO[producto]}"
+        )
+    tope = min(LICENCIAS_POR_FAMILIA[tipo], cuenta.ranuras_totales)
+    ocupadas = (
+        db.query(DetalleLicencia)
+        .filter(DetalleLicencia.cuenta_id == cuenta_id, DetalleLicencia.activo_id != activo.id)
+        .count()
+    )
+    if ocupadas >= tope:
+        raise HTTPException(
+            409, f"{cuenta.nombre} ya tiene sus {tope} licencias; elige otra familia"
+        )
+
+
+@app.post("/api/cuentas-licencia")
+def crear_cuenta_licencia(
+    datos: schemas.CuentaLicenciaIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    validar_ranuras(datos)
+    cuenta = CuentaLicencia(**datos.model_dump())
+    db.add(cuenta)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Ya existe una cuenta con ese nombre")
+    registrar(db, usuario, "CREAR", "cuenta_licencia", cuenta.id, datos.nombre)
+    db.commit()
+    return {"id": cuenta.id, "nombre": cuenta.nombre}
+
+
+@app.put("/api/cuentas-licencia/{cuenta_id}")
+def editar_cuenta_licencia(
+    cuenta_id: int,
+    datos: schemas.CuentaLicenciaIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    cuenta = db.get(CuentaLicencia, cuenta_id)
+    if cuenta is None:
+        raise HTTPException(404, "Cuenta no encontrada")
+    validar_ranuras(datos, db.query(DetalleLicencia).filter_by(cuenta_id=cuenta_id).count())
+    for campo, valor in datos.model_dump().items():
+        setattr(cuenta, campo, valor)
+    registrar(db, usuario, "EDITAR", "cuenta_licencia", cuenta.id, cuenta.nombre)
+    db.commit()
+    return {"id": cuenta.id, "nombre": cuenta.nombre}
+
+
+@app.delete("/api/cuentas-licencia/{cuenta_id}")
+def eliminar_cuenta_licencia(
+    cuenta_id: int,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    cuenta = db.get(CuentaLicencia, cuenta_id)
+    if cuenta is None:
+        raise HTTPException(404, "Cuenta no encontrada")
+    en_uso = db.query(DetalleLicencia).filter_by(cuenta_id=cuenta_id).count()
+    if en_uso:
+        raise HTTPException(
+            409, f"La cuenta tiene {en_uso} licencia(s) registrada(s). Elimínalas primero."
+        )
+    nombre = cuenta.nombre
+    db.delete(cuenta)
+    registrar(db, usuario, "ELIMINAR", "cuenta_licencia", cuenta_id, nombre)
+    db.commit()
+    return {"ok": True}
+
+
+PRODUCTOS_LICENCIA = {
+    "microsoft": (TipoActivo.LICENCIA_MICROSOFT, "microsoft"),
+    "norton": (TipoActivo.LICENCIA_NORTON, "norton"),
+}
+
+
+@app.get("/api/licencias/familias")
+def licencias_por_familia(
+    producto: str = Query("microsoft", pattern="^(microsoft|norton)$"),
+    db: Session = Depends(obtener_sesion),
+    _=Depends(usuario_actual),
+):
+    """Licencias agrupadas por familia (cuenta), con quién las usa y dónde está."""
+    tipo, palabra = PRODUCTOS_LICENCIA[producto]
+    licencias = (
+        db.query(Activo)
+        .join(DetalleLicencia)
+        .filter(Activo.tipo == tipo)
+        .order_by(Activo.codigo)
+        .all()
+    )
+    grupos: dict[int | None, list[dict]] = {}
+    for a in licencias:
+        d = a.detalle_licencia
+        vig = asignacion_vigente(db, a.id)
+        e = vig.empleado if vig else None
+        grupos.setdefault(d.cuenta_id, []).append(
+            {
+                "id": a.id,
+                "codigo": a.codigo,
+                "estatus": a.estatus.value,
+                "correo_licencia": d.correo_licencia,
+                "identificador": d.identificador_dispositivo,
+                "fecha_adquisicion": a.fecha_adquisicion,
+                "fecha_vencimiento": a.fecha_vencimiento,
+                "asignacion_id": vig.id if vig else None,
+                "empleado_id": e.id if e else None,
+                "empleado": e.nombre_completo if e else None,
+                "sucursal": e.sucursal.nombre if e and e.sucursal else None,
+                "bodega": e.bodega.nombre if e and e.bodega else None,
+                "departamento": e.departamento.nombre if e and e.departamento else None,
+                "planta": e.planta.nombre if e and e.planta else None,
+                "sucursal_id": e.sucursal_id if e else None,
+                "departamento_id": e.departamento_id if e else None,
+                "bodega_id": e.bodega_id if e else None,
+                "planta_id": e.planta_id if e else None,
+            }
+        )
+
+    cuentas = [
+        c
+        for c in db.query(CuentaLicencia).order_by(CuentaLicencia.id)
+        if c.id in grupos or (c.activo and palabra in (c.producto or "").lower())
+    ]
+    salida = [
+        {
+            "cuenta": {
+                "id": c.id,
+                "nombre": c.nombre,
+                "producto": c.producto,
+                "correo_cuenta": c.correo_cuenta,
+                "referencia_credencial": c.referencia_credencial,
+                "ranuras_totales": c.ranuras_totales,
+                "fecha_renovacion": c.fecha_renovacion,
+                "notas": c.notas,
+            },
+            "licencias": grupos.get(c.id, []),
+        }
+        for c in cuentas
+    ]
+    if grupos.get(None):
+        salida.append({"cuenta": None, "licencias": grupos[None]})
+    return salida
+
+
+# --------------------------------------------------------------------------
+# Empleados
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/empleados")
+def listar_empleados(
+    q: str | None = Query(None, max_length=100),
+    sucursal_id: int | None = None,
+    departamento_id: int | None = None,
+    bodega_id: int | None = None,
+    planta_id: int | None = None,
+    estatus: EstatusEmpleado | None = None,
+    db: Session = Depends(obtener_sesion),
+    _=Depends(usuario_actual),
+):
+    consulta = db.query(Empleado)
+    if q:
+        patron = patron_busqueda(q)
+        consulta = consulta.filter(
+            or_(
+                func.upper(Empleado.nombre_completo).like(patron, escape="\\"),
+                func.upper(Empleado.codigo).like(patron, escape="\\"),
+                Empleado.id.in_(
+                    db.query(Asignacion.empleado_id)
+                    .join(DetalleCorreo, DetalleCorreo.activo_id == Asignacion.activo_id)
+                    .filter(
+                        Asignacion.fecha_devolucion.is_(None),
+                        func.upper(DetalleCorreo.direccion).like(patron, escape="\\"),
+                    )
+                ),
+            )
+        )
+    consulta = consulta.filter(*filtro_ubicacion(sucursal_id, departamento_id, bodega_id, planta_id))
+    if estatus:
+        consulta = consulta.filter(Empleado.estatus == estatus)
+
+    empleados = consulta.order_by(Empleado.nombre_completo).all()
+    ids = [e.id for e in empleados]
+    def contar(fisicos: bool) -> dict:
+        if not ids:
+            return {}
+        filtro = Activo.tipo.in_(TIPOS_FISICOS) if fisicos else Activo.tipo.notin_(TIPOS_FISICOS)
+        return dict(
+            db.query(Asignacion.empleado_id, func.count(Asignacion.id))
+            .join(Activo, Activo.id == Asignacion.activo_id)
+            .filter(
+                Asignacion.empleado_id.in_(ids),
+                Asignacion.fecha_devolucion.is_(None),
+                filtro,
+            )
+            .group_by(Asignacion.empleado_id)
+            .all()
+        )
+
+    activos, servicios = contar(True), contar(False)
+    correos = correos_asignados(db, ids)
+    salida = []
+    for e in empleados:
+        d = dic_empleado(e)
+        d["total_activos"] = activos.get(e.id, 0)
+        d["total_servicios"] = servicios.get(e.id, 0)
+        d["correos"] = correos.get(e.id, [])
+        salida.append(d)
+    return salida
+
+
+ESTADO_DOC_TEXTO = {
+    "PENDIENTE": "Pendiente de enviar",
+    "ENVIADA": "En espera de firma",
+    "FIRMADA": "Firmada",
+    "NO_APLICA": "No aplica",
+}
+
+TIPO_ACTIVO_TEXTO = {
+    TipoActivo.COMPUTO: "Equipo de cómputo",
+    TipoActivo.TABLETA: "Tablet",
+    TipoActivo.TELEFONO: "Teléfono",
+}
+
+
+def _neutralizar_formulas(wb) -> None:
+    """Un texto que empieza con = + - @ se abriría como fórmula en Excel: se antepone una comilla."""
+    for hoja in wb.worksheets:
+        for fila in hoja.iter_rows():
+            for celda in fila:
+                if celda.data_type in ("s", "f") and isinstance(celda.value, str) \
+                        and celda.value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+                    celda.value = "'" + celda.value
+                    celda.data_type = "s"
+
+
+def _descarga_excel(hoja_titulo: str, columnas: list[str], filas: list[list], anchos: list[int], nombre: str):
+    """Una hoja con encabezado fijo y filtros. Una celda (texto, url) se escribe como enlace."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    hoja = wb.active
+    hoja.title = hoja_titulo
+    hoja.append(columnas)
+    for celda in hoja[1]:
+        celda.font = Font(bold=True)
+        celda.fill = PatternFill("solid", fgColor="DDEBF7")
+        celda.alignment = Alignment(vertical="center", wrap_text=True)
+
+    for n, fila in enumerate(filas, start=2):
+        for col, valor in enumerate(fila, start=1):
+            if isinstance(valor, tuple):
+                texto, url = valor
+                celda = hoja.cell(row=n, column=col, value=texto)
+                if url:
+                    celda.hyperlink = url
+                    celda.font = Font(color="0563C1", underline="single")
+            else:
+                celda = hoja.cell(row=n, column=col, value=valor)
+            if isinstance(valor, dt.date):
+                celda.number_format = "DD/MM/YYYY"
+            celda.alignment = Alignment(vertical="top", wrap_text=True)
+
+    for i, ancho in enumerate(anchos, start=1):
+        hoja.column_dimensions[get_column_letter(i)].width = ancho
+    hoja.freeze_panes = "A2"
+    hoja.auto_filter.ref = hoja.dimensions
+
+    _neutralizar_formulas(wb)
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{nombre}_{hoy_local():%Y%m%d}.xlsx"'},
+    )
+
+
+def _enlace_documento(request: Request, asignacion: dict | None, cual: str):
+    """Liga del PDF o imagen de una responsiva o INE, o vacío si no hay."""
+    if not asignacion:
+        return ""
+    archivo = asignacion[f"{cual}_archivo"]
+    if archivo:
+        url = f"{str(request.base_url).rstrip('/')}/api/adjuntos/{quote(archivo)}"
+        return (asignacion[f"{cual}_nombre"] or archivo, url)
+    url = asignacion[f"{cual}_url"]
+    return (url, url) if url else ""
+
+
+@app.get("/api/empleados/exportar")
+def exportar_empleados(
+    q: str | None = Query(None, max_length=100),
+    sucursal_id: int | None = None,
+    departamento_id: int | None = None,
+    bodega_id: int | None = None,
+    planta_id: int | None = None,
+    estatus: EstatusEmpleado | None = None,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(usuario_actual),
+):
+    empleados = listar_empleados(
+        q, sucursal_id, departamento_id, bodega_id, planta_id, estatus, db, usuario
+    )
+    ids = [e["id"] for e in empleados]
+    equipos: dict[int, list[str]] = {}
+    if ids:
+        for a in (
+            db.query(Asignacion)
+            .join(Activo, Activo.id == Asignacion.activo_id)
+            .filter(
+                Asignacion.empleado_id.in_(ids),
+                Asignacion.fecha_devolucion.is_(None),
+                Activo.tipo.in_(TIPOS_FISICOS),
+            )
+            .order_by(Activo.codigo)
+        ):
+            texto = f"{a.activo.codigo} ({TIPO_ACTIVO_TEXTO.get(a.activo.tipo, a.activo.tipo.value)})"
+            if a.activo.tipo in TIPOS_CON_RESPONSIVA:
+                texto += f" · Responsiva: {ESTADO_DOC_TEXTO[a.responsiva_estado.value]}"
+            equipos.setdefault(a.empleado_id, []).append(texto)
+
+    filas = [
+        [
+            e["codigo"], e["nombre_completo"], "\n".join(e["correos"]), e["puesto"],
+            e["departamento"], e["sucursal"], e["bodega"] or e["planta"], e["estatus"],
+            e["fecha_ingreso"], e["fecha_baja"], e["total_activos"],
+            "\n".join(equipos.get(e["id"], [])), e["total_servicios"],
+        ]
+        for e in empleados
+    ]
+    return _descarga_excel(
+        "Empleados",
+        ["Código", "Nombre completo", "Correos", "Puesto", "Departamento", "Sucursal",
+         "Locación", "Estatus", "Fecha de ingreso", "Fecha de baja", "Activos",
+         "Equipos asignados", "Licencias y correos"],
+        filas,
+        [12, 34, 32, 24, 22, 18, 24, 11, 14, 14, 9, 52, 12],
+        "empleados",
+    )
+
+
+@app.get("/api/empleados/{empleado_id}")
+def ver_empleado(
+    empleado_id: int, db: Session = Depends(obtener_sesion), _=Depends(usuario_actual)
+):
+    empleado = db.get(Empleado, empleado_id)
+    if empleado is None:
+        raise HTTPException(404, "Empleado no encontrado")
+    return dic_empleado(empleado, con_activos=True, db=db)
+
+
+def lugar_trabajo(e: Empleado) -> str:
+    if e.bodega:
+        return e.bodega.nombre
+    return e.planta.nombre if e.planta else ""
+
+
+def nombre_completo(datos: schemas.EmpleadoIn) -> str:
+    return " ".join(f"{datos.apellidos} {datos.nombres}".split()).upper()
+
+
+def validar_lugar_trabajo(datos: schemas.EmpleadoIn) -> None:
+    if datos.bodega_id and datos.planta_id:
+        raise HTTPException(422, "Un empleado solo puede tener bodega o planta, no ambas")
+
+
+def validar_empleado_unico(db: Session, clave: str, excluir_id: int | None = None) -> None:
+    consulta = db.query(Empleado).filter(Empleado.nombre_clave == clave)
+    if excluir_id is not None:
+        consulta = consulta.filter(Empleado.id != excluir_id)
+    existente = consulta.first()
+    if existente:
+        raise HTTPException(
+            409,
+            f"{existente.nombre_completo} ya está registrado como {existente.codigo} "
+            f"({existente.estatus.value})",
+        )
+
+
+@app.post("/api/empleados")
+@un_alta_a_la_vez
+def crear_empleado(
+    datos: schemas.EmpleadoIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    validar_lugar_trabajo(datos)
+    clave = clave_nombre(datos.nombres, datos.apellidos)
+    validar_empleado_unico(db, clave)
+    empleado = Empleado(
+        codigo=siguiente_codigo_empleado(db),
+        nombre_completo=nombre_completo(datos),
+        nombre_clave=clave,
+        **datos.model_dump(),
+    )
+    db.add(empleado)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Ya existe un empleado con ese código o nombre")
+    registrar(db, usuario, "CREAR", "empleado", empleado.id, empleado.nombre_completo)
+    db.commit()
+    return dic_empleado(empleado)
+
+
+@app.put("/api/empleados/{empleado_id}")
+def editar_empleado(
+    empleado_id: int,
+    datos: schemas.EmpleadoIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    empleado = db.get(Empleado, empleado_id)
+    if empleado is None:
+        raise HTTPException(404, "Empleado no encontrado")
+    validar_lugar_trabajo(datos)
+    clave = clave_nombre(datos.nombres, datos.apellidos)
+    validar_empleado_unico(db, clave, excluir_id=empleado_id)
+    for campo, valor in datos.model_dump().items():
+        setattr(empleado, campo, valor)
+    empleado.nombre_completo = nombre_completo(datos)
+    empleado.nombre_clave = clave
+    registrar(db, usuario, "EDITAR", "empleado", empleado.id, empleado.nombre_completo)
+    db.commit()
+    return dic_empleado(empleado)
+
+
+@app.delete("/api/empleados/{empleado_id}")
+def eliminar_empleado(
+    empleado_id: int,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    empleado = db.get(Empleado, empleado_id)
+    if empleado is None:
+        raise HTTPException(404, "Empleado no encontrado")
+
+    total = db.query(Asignacion).filter(Asignacion.empleado_id == empleado_id).count()
+    if total:
+        raise HTTPException(
+            409,
+            f"Tiene {total} asignación(es) en su historial. "
+            "Para conservar el rastro de los activos, márcalo como BAJA en lugar de eliminarlo.",
+        )
+    nombre = empleado.nombre_completo
+    db.delete(empleado)
+    registrar(db, usuario, "ELIMINAR", "empleado", empleado_id, nombre)
+    db.commit()
+    return {"ok": True}
+
+
