@@ -1,0 +1,192 @@
+/* Panel de control TI — capa de pulido.
+   Se carga después de theme.css. Los temas siguen definiendo los colores; aquí se
+   decide cómo se aplican: superficies planas, color sólo en los datos y la acción,
+   etiquetas en minúsculas legibles y movimiento corto que responde al usuario
+   (sin escalonados ni rebotes en lo que se abre decenas de veces al día). */
+
+:root {
+  --radio: 8px;
+  --radio-sm: 6px;
+  --sombra: 0 8px 24px var(--sombra-media);
+
+  /* Curvas con más empuje que las de CSS: salida rápida, sin rebote */
+  --curva: cubic-bezier(.23, 1, .32, 1);
+  --curva-suave: cubic-bezier(.23, 1, .32, 1);
+
+  /* Sin degradados: todo lo que los usaba toma el color primario sólido */
+  --degradado: var(--primario);
+}
+
+/* Cada tema mantiene sus colores; sólo se aplanan los fondos que eran degradado */
+[data-tema="aurora"] { --sidebar-bg: #0C1030; --degradado: var(--primario); }
+[data-tema="carmesi"] { --sidebar-bg: #1C040C; --degradado: var(--primario); }
+[data-tema="grafito"], [data-tema="neon"] { --degradado: var(--primario); }
+
+/* Claro: un solo matiz de acento, el azul de la acción */
+[data-tema="claro"] {
+  --bg: #F4F5F7;
+  --surface-3: #F4F5F7;
+  --primario: #0A62B0;
+  --acento: #0A62B0;
+  --degradado: #0A62B0;
+  --sidebar-bg: #15202B;
+  --sidebar-borde: #243342;
+  --sidebar-activo: #6DB8F2;
+}
+
+body { font-variant-numeric: tabular-nums; -webkit-font-smoothing: antialiased; }
+
+/* ---------- Marca y menú lateral ---------- */
+
+.marca img, .login-marca img, .caja-login img { filter: none; animation: none; }
+.marca h1 { background: none; color: var(--sidebar-fuerte); -webkit-text-fill-color: currentColor; font-size: 15px; }
+.marca span { letter-spacing: 0; font-size: 12px; }
+
+.en-linea::before { box-shadow: none; animation: none; }
+.avatar { background: color-mix(in srgb, var(--primario) 22%, var(--surface-3)); color: var(--texto); }
+
+.nav-grupo { text-transform: none; letter-spacing: 0; font-size: 12.5px; font-weight: 600; padding: 18px 24px 6px; }
+.nav button { transition: background-color .15s var(--curva), color .15s var(--curva); }
+.nav button:hover { transform: none; }
+
+/* ---------- Barra superior y flotantes ---------- */
+
+.barra-superior { backdrop-filter: none; }
+.flotante-titulo { text-transform: none; letter-spacing: 0; font-size: 12.5px; }
+
+/* ---------- Superficies planas ---------- */
+
+.tarjeta, .panel { box-shadow: none; }
+.tarjeta:hover { transform: none; box-shadow: none; border-color: var(--border-fuerte); }
+.tarjeta .etiqueta { text-transform: none; letter-spacing: 0; font-size: 14px; }
+.panel h3, .panel-cab h3 {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--texto);
+}
+
+thead th { text-transform: none; letter-spacing: 0; font-size: 13.5px; font-weight: 600; }
+tbody tr.clicable:hover, .nota:hover, .alerta-item:hover, .fila-ranking:hover { transform: none; }
+
+.insignia { letter-spacing: 0; }
+.insignia:hover { transform: none; }
+.dona-sub, .vence-producto, .item-check .grupo { text-transform: none; letter-spacing: 0; }
+
+/* ---------- Botones ---------- */
+
+button::after, .boton::after { display: none; }
+.btn-primario:hover, .btn-secundario:hover, .btn-peligro:hover { transform: none; box-shadow: none; }
+.btn-primario:hover { background: color-mix(in srgb, var(--primario) 88%, var(--texto)); }
+button:active, .boton:active { transform: scale(.97); transition-duration: .1s; }
+button:focus-visible, .boton:focus-visible { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--primario); }
+
+/* ---------- Tablero ---------- */
+
+.tarjeta.kpi {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  animation: none;
+}
+.tarjeta.kpi:hover { transform: none; box-shadow: none; border-color: var(--border-fuerte); }
+.kpi-cuerpo { padding: 20px 22px 16px; }
+.tarjeta.kpi .valor { font-size: 44px; font-weight: 600; letter-spacing: -.02em; line-height: 1; }
+.tarjeta.kpi .etiqueta { margin-top: 10px; font-size: 15px; font-weight: 600; color: var(--texto); }
+.tarjeta.kpi .pie { margin-top: 2px; color: var(--texto-tenue); }
+.kpi-pie {
+  background: none;
+  border-top: 1px solid var(--border);
+  color: var(--primario);
+}
+.kpi-pie svg { color: currentColor; }
+.tarjeta.kpi:hover .kpi-pie svg { transform: translateX(3px); }
+
+.acceso {
+  flex-direction: row;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  text-align: left;
+  background: var(--surface);
+  animation: none;
+}
+.acceso .ico { width: auto; height: auto; background: none; color: var(--primario); border-radius: 0; }
+.acceso .ico svg { width: 20px; height: 20px; }
+.acceso:hover { transform: none; box-shadow: none; border-color: var(--primario); background: var(--surface-3); }
+.acceso:hover .ico { transform: none; }
+.accesos { grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px; }
+
+.barra-fila .relleno, .avance div { background: var(--primario); }
+.familia-cab, .familia.excedida .familia-cab { background: var(--surface-3); }
+.familia.excedida .familia-cab { background: color-mix(in srgb, var(--peligro) 10%, var(--surface)); }
+.familia-uso .relleno, .familia-barra div { background: var(--primario); }
+
+/* ---------- Login ---------- */
+
+.login-marca { background: var(--sidebar-bg); }
+.login-marca::before, .login-marca::after { display: none; }
+.login-marca h1 { font-size: clamp(40px, 4.4vw, 64px); line-height: 1.02; font-weight: 700; letter-spacing: -.025em; }
+.login-marca h1 em { background: none; color: var(--sidebar-activo); -webkit-text-fill-color: currentColor; }
+.login-marca .firma { letter-spacing: 0; font-size: 16px; font-weight: 500; }
+.caja-login { box-shadow: none; border-radius: 12px; }
+.caja-login .btn-primario { height: 44px; }
+
+/* ---------- Modales y avisos ---------- */
+
+.fondo-modal { backdrop-filter: none; background: color-mix(in srgb, var(--sombra-base) 62%, transparent); }
+.modal { animation: entrar-modal .2s var(--curva) both; }
+@keyframes entrar-modal {
+  from { opacity: 0; transform: scale(.97); }
+  to { opacity: 1; transform: none; }
+}
+.aviso.warn { animation: none; }
+.velo { backdrop-filter: none; }
+.velo-caja { text-transform: none; letter-spacing: 0; }
+
+/* ---------- Movimiento: sólo lo que explica un cambio ----------
+   Entrar a una vista es algo que se hace decenas de veces al día, así que
+   el contenido aparece de golpe, sin escalonados ni filas que se deslizan. */
+
+#vista > .encabezado,
+#vista > .tarjetas > .tarjeta,
+#vista > .panel,
+#vista > .filtros,
+#vista > div > .tabla-wrap,
+.tarjeta .valor,
+tbody tr,
+.nota, .alerta-item, .item-check, .fila-ranking {
+  animation: none;
+}
+#vista { animation: aparecer .14s var(--curva) both; }
+
+.grafica .barra { animation-duration: .35s; }
+
+@media (max-width: 900px) {
+  .login-marca { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #vista { animation: none; }
+}
+
+/* ---------- Filtros y controles de formulario ---------- */
+
+.filtros { align-items: flex-end; gap: 12px; }
+.filtros > *, .filtros .campo { margin-bottom: 0; }
+input, select, textarea { font-size: 15px; border-radius: var(--radio-sm); }
+.filtros input, .filtros select { height: 40px; }
+
+/* ---------- Tablero más compacto: todo lo pedido cabe en la primera pantalla ---------- */
+
+.kpis { gap: 12px; margin-bottom: 16px; }
+.kpi-cuerpo { padding: 16px 20px 12px; }
+.tarjeta.kpi .valor { font-size: 36px; }
+.tarjeta.kpi .etiqueta { margin-top: 8px; }
+.kpi-pie { padding: 8px 20px; }
+
+/* ---------- Foto de perfil ---------- */
+
+.avatar.con-foto { background-size: cover; background-position: center; background-color: var(--surface-3); }
+.avatar.grande { width: 84px; height: 84px; font-size: 28px; }
+.avatar.chico { display: inline-grid; width: 28px; height: 28px; font-size: 11px; margin-right: 8px; vertical-align: middle; }
