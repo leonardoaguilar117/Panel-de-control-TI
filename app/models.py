@@ -508,3 +508,276 @@ class RedWifi(Base):
 # Asignaciones: el historial que hoy no existe
 # --------------------------------------------------------------------------
 
+
+class Asignacion(Base):
+    """Vincula un activo con un empleado durante un periodo.
+
+    Un activo puede tener muchas asignaciones a lo largo del tiempo, pero solo
+    una vigente (fecha_devolucion NULL). Asi el equipo conserva su rastro cuando
+    la persona cambia de puesto o causa baja.
+    """
+
+    __tablename__ = "asignacion"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    activo_id: Mapped[int] = mapped_column(ForeignKey("activo.id"), index=True)
+    empleado_id: Mapped[int] = mapped_column(ForeignKey("empleado.id"), index=True)
+
+    fecha_asignacion: Mapped[dt.date] = mapped_column(Date, default=hoy)
+    fecha_devolucion: Mapped[dt.date | None] = mapped_column(Date, index=True)
+
+    responsiva_estado: Mapped[EstadoDocumento] = mapped_column(
+        Enum(EstadoDocumento), default=EstadoDocumento.PENDIENTE, index=True
+    )
+    # Cuando se mandó a firmar. Con esta fecha se sabe cuánto lleva esperando.
+    responsiva_fecha_envio: Mapped[dt.date | None] = mapped_column(Date)
+    responsiva_fecha_firma: Mapped[dt.date | None] = mapped_column(Date)
+    responsiva_destino: Mapped[str | None] = mapped_column(String(160))
+    # Enlace externo (Drive) o archivo subido al servidor. Pueden coexistir.
+    responsiva_url: Mapped[str | None] = mapped_column(String(400))
+    responsiva_archivo: Mapped[str | None] = mapped_column(String(80))
+    responsiva_nombre: Mapped[str | None] = mapped_column(String(200))
+
+    ine_estado: Mapped[EstadoDocumento] = mapped_column(
+        Enum(EstadoDocumento), default=EstadoDocumento.PENDIENTE
+    )
+    ine_url: Mapped[str | None] = mapped_column(String(400))
+    ine_archivo: Mapped[str | None] = mapped_column(String(80))
+    ine_nombre: Mapped[str | None] = mapped_column(String(200))
+
+    motivo_devolucion: Mapped[str | None] = mapped_column(String(160))
+    notas: Mapped[str | None] = mapped_column(Text)
+
+    creado_en: Mapped[dt.datetime] = mapped_column(DateTime, default=ahora)
+
+    activo: Mapped[Activo] = relationship(back_populates="asignaciones")
+    empleado: Mapped[Empleado] = relationship(back_populates="asignaciones")
+
+
+# --------------------------------------------------------------------------
+# Usuarios del sistema y bitacora
+# --------------------------------------------------------------------------
+
+
+class Usuario(Base):
+    __tablename__ = "usuario"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    nombre: Mapped[str] = mapped_column(String(120))
+    password_hash: Mapped[str] = mapped_column(String(255))
+    rol: Mapped[RolUsuario] = mapped_column(Enum(RolUsuario), default=RolUsuario.CONSULTA)
+    activo: Mapped[bool] = mapped_column(Boolean, default=True)
+    ultimo_acceso: Mapped[dt.datetime | None] = mapped_column(DateTime)
+    creado_en: Mapped[dt.datetime] = mapped_column(DateTime, default=ahora)
+
+    # Perfil: la foto es el nombre del archivo en adjuntos
+    foto: Mapped[str | None] = mapped_column(String(80))
+    correo: Mapped[str | None] = mapped_column(String(160))
+    telefono: Mapped[str | None] = mapped_column(String(30))
+    puesto: Mapped[str | None] = mapped_column(String(80))
+    # Verdadero mientras la cuenta conserve la contraseña de fábrica
+    debe_cambiar_password: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class Sesion(Base):
+    __tablename__ = "sesion"
+
+    token: Mapped[str] = mapped_column(String(64), primary_key=True)
+    usuario_id: Mapped[int] = mapped_column(ForeignKey("usuario.id"), index=True)
+    creada_en: Mapped[dt.datetime] = mapped_column(DateTime, default=ahora)
+    expira_en: Mapped[dt.datetime] = mapped_column(DateTime, index=True)
+
+    usuario: Mapped[Usuario] = relationship()
+
+
+# --------------------------------------------------------------------------
+# Notas y pendientes compartidos
+# --------------------------------------------------------------------------
+
+
+class Nota(Base):
+    """Recados y pendientes visibles para todo el equipo de TI.
+
+    Puede colgar de un empleado o de un activo, o quedar suelta como
+    pendiente general del área.
+    """
+
+    __tablename__ = "nota"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    titulo: Mapped[str] = mapped_column(String(160))
+    contenido: Mapped[str | None] = mapped_column(Text)
+    estado: Mapped[EstadoNota] = mapped_column(
+        Enum(EstadoNota), default=EstadoNota.PENDIENTE, index=True
+    )
+    prioridad: Mapped[Prioridad] = mapped_column(Enum(Prioridad), default=Prioridad.MEDIA)
+
+    empleado_id: Mapped[int | None] = mapped_column(ForeignKey("empleado.id"))
+    activo_id: Mapped[int | None] = mapped_column(ForeignKey("activo.id"))
+
+    autor_id: Mapped[int | None] = mapped_column(ForeignKey("usuario.id"))
+    autor_nombre: Mapped[str | None] = mapped_column(String(120))
+    resuelta_por: Mapped[str | None] = mapped_column(String(120))
+    resuelta_en: Mapped[dt.datetime | None] = mapped_column(DateTime)
+
+    creado_en: Mapped[dt.datetime] = mapped_column(DateTime, default=ahora)
+    actualizado_en: Mapped[dt.datetime] = mapped_column(
+        DateTime, default=ahora, onupdate=ahora
+    )
+
+    empleado: Mapped[Empleado | None] = relationship()
+    activo: Mapped[Activo | None] = relationship()
+
+
+# --------------------------------------------------------------------------
+# Auditoria semanal
+# --------------------------------------------------------------------------
+
+
+class Auditoria(Base):
+    """Revision semanal de correo o de Norton, resuelta como checklist."""
+
+    __tablename__ = "auditoria"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tipo: Mapped[TipoAuditoria] = mapped_column(Enum(TipoAuditoria), index=True)
+    fecha_inicio: Mapped[dt.date] = mapped_column(Date, index=True)
+    fecha_fin: Mapped[dt.date] = mapped_column(Date)
+    estado: Mapped[EstadoAuditoria] = mapped_column(
+        Enum(EstadoAuditoria), default=EstadoAuditoria.EN_PROCESO, index=True
+    )
+
+    # Analista de TI al que se le asigna la revisión
+    analista_id: Mapped[int | None] = mapped_column(ForeignKey("usuario.id"), index=True)
+    analista_nombre: Mapped[str | None] = mapped_column(String(120))
+    programada_por: Mapped[str | None] = mapped_column(String(120))
+
+    observaciones: Mapped[str | None] = mapped_column(Text)
+    # Umbral del punto de dispositivos sin actividad (auditoría de Norton)
+    dias_sin_actividad: Mapped[int | None] = mapped_column(Integer)
+    fecha_cierre: Mapped[dt.datetime | None] = mapped_column(DateTime)
+    cerrada_por: Mapped[str | None] = mapped_column(String(120))
+
+    creado_en: Mapped[dt.datetime] = mapped_column(DateTime, default=ahora)
+
+    analista: Mapped[Usuario | None] = relationship()
+    items: Mapped[list[ItemAuditoria]] = relationship(
+        back_populates="auditoria", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("tipo", "fecha_inicio", name="uq_auditoria_periodo"),
+    )
+
+
+class ItemAuditoria(Base):
+    """Cada punto del checklist.
+
+    Unos vienen de la plantilla fija y otros los genera el sistema por
+    excepcion (una cuenta suspendida, una licencia sobreasignada).
+    """
+
+    __tablename__ = "item_auditoria"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    auditoria_id: Mapped[int] = mapped_column(ForeignKey("auditoria.id"), index=True)
+    orden: Mapped[int] = mapped_column(Integer, default=0)
+
+    categoria: Mapped[str] = mapped_column(String(60))
+    descripcion: Mapped[str] = mapped_column(String(400))
+    # Lo detectó el sistema, no la plantilla: arranca como posible incidencia
+    automatico: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    estado: Mapped[EstadoItem] = mapped_column(
+        Enum(EstadoItem), default=EstadoItem.PENDIENTE, index=True
+    )
+    observacion: Mapped[str | None] = mapped_column(Text)
+
+    activo_id: Mapped[int | None] = mapped_column(ForeignKey("activo.id"))
+    actualizado_por: Mapped[str | None] = mapped_column(String(120))
+    actualizado_en: Mapped[dt.datetime | None] = mapped_column(DateTime)
+
+    auditoria: Mapped[Auditoria] = relationship(back_populates="items")
+    activo: Mapped[Activo | None] = relationship()
+    evidencias: Mapped[list[EvidenciaAuditoria]] = relationship(
+        back_populates="item", cascade="all, delete-orphan", order_by="EvidenciaAuditoria.id"
+    )
+
+
+class EvidenciaAuditoria(Base):
+    """Archivo de Google Drive que respalda un punto del checklist."""
+
+    __tablename__ = "evidencia_auditoria"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("item_auditoria.id"), index=True)
+    nombre: Mapped[str] = mapped_column(String(200))
+    url: Mapped[str] = mapped_column(String(600))
+    agregado_por: Mapped[str | None] = mapped_column(String(120))
+    agregado_en: Mapped[dt.datetime] = mapped_column(DateTime, default=ahora)
+
+    item: Mapped[ItemAuditoria] = relationship(back_populates="evidencias")
+
+
+# --------------------------------------------------------------------------
+# Verificación mensual de números
+# --------------------------------------------------------------------------
+
+
+class LineaVerificacion(Base):
+    """Número de la empresa que entra en la verificación mensual."""
+
+    __tablename__ = "linea_verificacion"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    numero: Mapped[str] = mapped_column(String(20), unique=True, index=True)
+    titular: Mapped[str | None] = mapped_column(String(180))
+    sucursal: Mapped[str | None] = mapped_column(String(80))
+    departamento: Mapped[str | None] = mapped_column(String(80))
+    # Si la línea está en el inventario, el titular sale de su asignación vigente
+    activo_id: Mapped[int | None] = mapped_column(ForeignKey("activo.id", ondelete="SET NULL"))
+    creado_en: Mapped[dt.datetime] = mapped_column(DateTime, default=ahora)
+
+    activo: Mapped[Activo | None] = relationship()
+    verificaciones: Mapped[list[VerificacionNumero]] = relationship(
+        back_populates="linea", cascade="all, delete-orphan"
+    )
+
+
+class VerificacionNumero(Base):
+    __tablename__ = "verificacion_numero"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    linea_id: Mapped[int] = mapped_column(ForeignKey("linea_verificacion.id"), index=True)
+    periodo: Mapped[str] = mapped_column(String(7), index=True)  # AAAA-MM
+
+    verificada: Mapped[bool] = mapped_column(Boolean, default=False)
+    verificada_por: Mapped[str | None] = mapped_column(String(120))
+    verificada_en: Mapped[dt.datetime | None] = mapped_column(DateTime)
+    enviado_por: Mapped[str | None] = mapped_column(String(120))
+    enviado_en: Mapped[dt.datetime | None] = mapped_column(DateTime)
+    observacion: Mapped[str | None] = mapped_column(Text)
+
+    linea: Mapped[LineaVerificacion] = relationship(back_populates="verificaciones")
+
+    __table_args__ = (
+        UniqueConstraint("linea_id", "periodo", name="uq_verificacion_periodo"),
+    )
+
+
+class Bitacora(Base):
+    """Quien hizo que y cuando. Requisito para operar entre varias personas."""
+
+    __tablename__ = "bitacora"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    usuario_id: Mapped[int | None] = mapped_column(ForeignKey("usuario.id"))
+    usuario_nombre: Mapped[str | None] = mapped_column(String(120))
+    fecha: Mapped[dt.datetime] = mapped_column(DateTime, default=ahora, index=True)
+    accion: Mapped[str] = mapped_column(String(20))  # CREAR/EDITAR/ELIMINAR/ASIGNAR
+    entidad: Mapped[str] = mapped_column(String(40), index=True)
+    entidad_id: Mapped[int | None] = mapped_column(Integer)
+    detalle: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (UniqueConstraint("id", name="uq_bitacora_id"),)
