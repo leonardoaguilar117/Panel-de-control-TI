@@ -4912,3 +4912,232 @@ function modalCatalogo(entidad, f = null) {
   };
 }
 
+// ---------------------------------------------------------------- perfil
+
+// Reduce la foto a un cuadrado de 256 px antes de subirla: pesa poco y siempre cabe en el límite
+function recortarFoto(archivo, lado = 256) {
+  return new Promise((resolver, rechazar) => {
+    const url = URL.createObjectURL(archivo);
+    const img = new Image();
+    img.onload = () => {
+      const lienzo = document.createElement("canvas");
+      lienzo.width = lienzo.height = lado;
+      const corte = Math.min(img.width, img.height);
+      lienzo
+        .getContext("2d")
+        .drawImage(img, (img.width - corte) / 2, (img.height - corte) / 2, corte, corte, 0, 0, lado, lado);
+      URL.revokeObjectURL(url);
+      lienzo.toBlob((b) => (b ? resolver(b) : rechazar(new Error("No se pudo leer la imagen"))), "image/jpeg", 0.88);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      rechazar(new Error("El archivo no es una imagen válida"));
+    };
+    img.src = url;
+  });
+}
+
+function modalPerfil() {
+  const u = estado.usuario;
+  abrirModal(
+    "Mi perfil",
+    `<form id="form-perfil">
+      <div style="display:flex;align-items:center;gap:16px;margin-bottom:18px">
+        <span id="perfil-avatar" class="avatar grande"></span>
+        <div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <label class="btn-secundario btn-mini boton" style="margin:0;cursor:pointer;color:var(--texto-medio)">
+              Cambiar foto<input id="perfil-archivo" type="file" accept="image/jpeg,image/png,image/webp" hidden>
+            </label>
+            <button type="button" class="btn-secundario btn-mini" id="perfil-quitar" ${u.foto ? "" : "hidden"}>Quitar</button>
+          </div>
+          <div style="color:var(--texto-tenue);font-size:13px;margin-top:6px">JPG, PNG o WEBP. Se recorta en cuadrado.</div>
+        </div>
+      </div>
+      <div class="rejilla">
+        <div class="campo"><label>Usuario</label><input value="${esc(u.username)}" disabled></div>
+        <div class="campo"><label>Rol</label><input value="${esc(ROL_TEXTO[u.rol] || u.rol)}" disabled></div>
+        <div class="campo"><label>Nombre *</label><input name="nombre" required value="${esc(u.nombre)}"></div>
+        <div class="campo"><label>Puesto</label><input name="puesto" value="${esc(u.puesto || "")}"></div>
+        <div class="campo"><label>Correo</label><input name="correo" type="email" value="${esc(u.correo || "")}"></div>
+        <div class="campo"><label>Teléfono</label><input name="telefono" type="tel" value="${esc(u.telefono || "")}"></div>
+      </div>
+    </form>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Guardar</button>`
+  );
+
+  const avatar = $("#perfil-avatar");
+  pintarAvatar(avatar, u);
+  $("#cancelar").onclick = cerrarModal;
+
+  $("#perfil-archivo").onchange = async (e) => {
+    const archivo = e.target.files[0];
+    if (!archivo) return;
+    try {
+      const foto = await recortarFoto(archivo);
+      const datos = new FormData();
+      datos.append("archivo", foto, "foto.jpg");
+      estado.usuario = await api("/api/yo/foto", { method: "POST", body: datos });
+      pintarAvatar(avatar, estado.usuario);
+      $("#perfil-quitar").hidden = false;
+      refrescarAvatares();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+
+  $("#perfil-quitar").onclick = async () => {
+    try {
+      estado.usuario = await api("/api/yo/foto", { method: "DELETE" });
+      pintarAvatar(avatar, estado.usuario);
+      $("#perfil-quitar").hidden = true;
+      refrescarAvatares();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+
+  $("#guardar").onclick = async () => {
+    const form = $("#form-perfil");
+    if (!form.reportValidity()) return;
+    try {
+      estado.usuario = await api("/api/yo", { method: "PUT", body: JSON.stringify(recolectar(form)) });
+      cerrarModal();
+      refrescarAvatares();
+      toast("Perfil actualizado");
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
+function refrescarAvatares() {
+  const u = estado.usuario;
+  $("#sesion-nombre").textContent = u.nombre;
+  $("#nombre-barra").textContent = u.nombre.split(" ")[0];
+  $("#nombre-menu-usuario").textContent = u.nombre;
+  ["#avatar-menu", "#avatar-barra", "#avatar-menu-usuario"].forEach((s) => pintarAvatar($(s), u));
+  if (estado.vista === "usuarios") irA("usuarios");
+}
+
+// ---------------------------------------------------------------- contraseña de fábrica
+
+// Mientras la cuenta tenga la contraseña de fábrica no se puede usar nada más
+function cambioObligatorio() {
+  $("#login").hidden = false;
+  abrirModal(
+    "Cambia la contraseña de fábrica",
+    `<form id="form-obligatorio">
+      <p style="margin:0 0 14px;color:var(--texto-medio)">
+        Esta cuenta aún usa la contraseña inicial. Elige una propia para continuar.
+      </p>
+      <div class="campo"><label>Contraseña actual</label>
+        <input name="password_actual" type="password" autocomplete="current-password" required></div>
+      <div class="campo"><label>Contraseña nueva (mínimo 8 caracteres)</label>
+        <input name="password_nueva" type="password" autocomplete="new-password" minlength="8" required></div>
+      <div class="campo"><label>Repite la contraseña nueva</label>
+        <input name="repetir" type="password" autocomplete="new-password" minlength="8" required></div>
+    </form>`,
+    `<button class="btn-secundario" id="salir-obligatorio">Cerrar sesión</button>
+     <button class="btn-primario" id="guardar">Cambiar y entrar</button>`
+  );
+  $("#modal .cerrar").remove();
+  $("#modal .fondo-modal").onclick = null;
+  $("#modal .fondo-modal").onmousedown = null;
+
+  $("#salir-obligatorio").onclick = async () => {
+    await api("/api/logout", { method: "POST" });
+    estado.usuario = null;
+    cerrarModal();
+    mostrarLogin();
+  };
+  $("#guardar").onclick = async () => {
+    const form = $("#form-obligatorio");
+    if (!form.reportValidity()) return;
+    const datos = recolectar(form);
+    if (datos.password_nueva !== datos.repetir) return toast("Las contraseñas nuevas no coinciden", "error");
+    try {
+      await api("/api/yo/password", {
+        method: "POST",
+        body: JSON.stringify({ password_actual: datos.password_actual, password_nueva: datos.password_nueva }),
+      });
+      estado.usuario = await api("/api/yo");
+      cerrarModal();
+      toast("Contraseña actualizada");
+      await arrancar();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
+// ---------------------------------------------------------------- contraseña
+
+function modalPassword() {
+  abrirModal(
+    "Cambiar contraseña",
+    `<form id="form-pass">
+      <div class="campo"><label>Contraseña actual</label>
+        <input name="password_actual" type="password" required></div>
+      <div class="campo"><label>Contraseña nueva (mínimo 8 caracteres)</label>
+        <input name="password_nueva" type="password" minlength="8" required></div>
+    </form>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Cambiar</button>`
+  );
+  $("#cancelar").onclick = cerrarModal;
+  $("#guardar").onclick = async () => {
+    const form = $("#form-pass");
+    if (!form.reportValidity()) return;
+    try {
+      await api("/api/yo/password", { method: "POST", body: JSON.stringify(recolectar(form)) });
+      cerrarModal();
+      toast("Contraseña actualizada");
+      estado.usuario = await api("/api/yo");
+      irA("tablero");
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
+// ---------------------------------------------------------------- arranque
+
+$("#form-login").onsubmit = iniciarSesion;
+$("#btn-salir").onclick = async () => {
+  cerrarFlotantes();
+  try {
+    sessionStorage.removeItem("aviso-vencimientos");
+  } catch (_) {}
+  await api("/api/logout", { method: "POST" });
+  estado.usuario = null;
+  mostrarLogin();
+};
+document
+  .querySelectorAll("#nav button")
+  .forEach((b) => (b.onclick = () => irA(b.dataset.vista)));
+$("#btn-menu").onclick = () => {
+  if (window.innerWidth > 960) {
+    const compacto = document.documentElement.classList.toggle("menu-compacto");
+    guardarPreferencia("menu-compacto", compacto ? "1" : "0");
+  } else {
+    menuMovil(!document.body.classList.contains("menu-abierto"));
+  }
+};
+pintarIconos();
+iniciarBarraSuperior();
+$("#velo-menu").onclick = () => menuMovil(false);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") menuMovil(false);
+});
+
+(async () => {
+  try {
+    estado.usuario = await api("/api/yo");
+    if (estado.usuario.password_por_defecto) cambioObligatorio();
+    else await arrancar();
+  } catch (_) {
+    mostrarLogin();
+  }
+})();
