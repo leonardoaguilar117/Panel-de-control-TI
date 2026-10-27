@@ -4439,3 +4439,476 @@ function pedirTexto(titulo, etiqueta, valor = "") {
   });
 }
 
+// ---------------------------------------------------------------- verificación de números
+
+const MENSAJE_VERIFICACION =
+  "Hola, buen día. Te contactamos del departamento de TI para realizar la verificación " +
+  "mensual de líneas telefónicas. ¿Nos podrías confirmar tu nombre completo para validar esta línea, por favor?" +
+  "\n\nAprovechamos para compartirte una actualización en nuestros canales de soporte. Para brindarles un " +
+  "mejor servicio y que todo el equipo de TI pueda dar seguimiento a sus solicitudes, a partir de ahora " +
+  "nuestro canal oficial de atención será el chat corporativo (usando tu correo institucional):" +
+  "\n\nWhatsApp quedará exclusivamente para procesos de verificación en dos pasos o colaboradores sin correo corporativo." +
+  "\n\n¡Agradecemos mucho tu apoyo y comprensión!";
+
+const enlaceWhatsApp = (numero) =>
+  `https://wa.me/52${numero}?text=${encodeURIComponent(MENSAJE_VERIFICACION)}`;
+
+const numeroLegible = (n) => (n.length === 10 ? `${n.slice(0, 3)} ${n.slice(3, 6)} ${n.slice(6)}` : n);
+
+const nombreMes = (periodo) => {
+  const [a, m] = periodo.split("-").map(Number);
+  const texto = new Date(a, m - 1, 1).toLocaleDateString("es-MX", { month: "long", year: "numeric" });
+  return texto.charAt(0).toUpperCase() + texto.slice(1);
+};
+
+async function verVerificacion() {
+  const periodo = estado.periodoVerificacion || hoyISO().slice(0, 7);
+  $("#vista").innerHTML = `
+    <div class="encabezado">
+      <div><h2>Verificación de números</h2><p>${esc(nombreMes(periodo))}</p></div>
+      ${puedeEditar() ? `<button class="btn-primario" id="btn-nuevo-numero">Agregar número</button>` : ""}
+    </div>
+    <div id="resumen-verificacion"></div>
+    <div class="filtros">
+      <div class="campo"><label>Mes</label>
+        <input id="v-mes" type="month" value="${periodo}" max="${hoyISO().slice(0, 7)}"></div>
+      <div class="campo busqueda"><label>Buscar</label>
+        <input id="v-q" placeholder="Número, titular, sucursal o departamento…"></div>
+      <div class="campo"><label>Estado</label>
+        <select id="v-estado">
+          <option value="">Todos</option>
+          <option value="PENDIENTE">Sin verificar</option>
+          <option value="ENVIADO">Mensaje enviado</option>
+          <option value="VERIFICADA">Verificados</option>
+        </select></div>
+    </div>
+    <div id="tabla-verificacion"></div>`;
+
+  $("#v-mes").onchange = () => {
+    if (!$("#v-mes").value) return;
+    estado.periodoVerificacion = $("#v-mes").value;
+    verVerificacion();
+  };
+  if (puedeEditar()) $("#btn-nuevo-numero").onclick = () => modalNumero();
+
+  const lista = await api(`/api/verificacion-numeros?periodo=${periodo}`);
+  const pintar = () => {
+    const q = $("#v-q").value.trim().toLowerCase();
+    const filtro = $("#v-estado").value;
+    pintarResumenVerificacion(lista);
+    pintarVerificacion(
+      lista.filter(
+        (l) =>
+          (!filtro ||
+            (filtro === "VERIFICADA" && l.verificada) ||
+            (filtro === "ENVIADO" && !l.verificada && l.enviado_en) ||
+            (filtro === "PENDIENTE" && !l.verificada)) &&
+          (!q ||
+            [l.numero, l.titular, l.sucursal, l.departamento].some((t) => (t || "").toLowerCase().includes(q)))
+      ),
+      lista,
+      periodo,
+      pintar
+    );
+  };
+  $("#v-q").oninput = pintar;
+  $("#v-estado").onchange = pintar;
+  pintar();
+}
+
+function pintarResumenVerificacion(lista) {
+  const total = lista.length;
+  const verificados = lista.filter((l) => l.verificada).length;
+  const enviados = lista.filter((l) => !l.verificada && l.enviado_en).length;
+  const avance = total ? Math.round((verificados / total) * 100) : 0;
+  $("#resumen-verificacion").innerHTML = `
+    <div class="tarjetas">
+      <div class="tarjeta"><div class="etiqueta">Números</div><div class="valor">${total}</div></div>
+      <div class="tarjeta cyan"><div class="etiqueta">Verificados</div><div class="valor">${verificados}</div>
+        <div class="avance"><div style="width:${avance}%"></div></div></div>
+      <div class="tarjeta rosa"><div class="etiqueta">Mensaje enviado</div><div class="valor">${enviados}</div></div>
+      <div class="tarjeta amarillo"><div class="etiqueta">Sin respuesta</div>
+        <div class="valor">${total - verificados}</div></div>
+    </div>`;
+}
+
+function pintarVerificacion(filas, lista, periodo, repintar) {
+  const editable = puedeEditar();
+  const tenue = (t) => `<span style="color:var(--texto-tenue)">${t}</span>`;
+  $("#tabla-verificacion").innerHTML = filas.length
+    ? `<div class="tabla-wrap"><table>
+        <thead><tr><th>Verificado</th><th>Número</th><th>Titular</th><th>Sucursal</th>
+          <th>Departamento</th><th>WhatsApp</th><th>Observación</th>${editable ? "<th></th>" : ""}</tr></thead>
+        <tbody>${filas
+          .map(
+            (l) => `<tr class="${l.verificada ? "verificada" : ""}">
+              <td><label class="casilla-verificacion">
+                <input type="checkbox" data-verificar="${l.id}" ${l.verificada ? "checked" : ""}
+                  ${editable ? "" : "disabled"} aria-label="Verificado">
+                ${
+                  l.verificada
+                    ? `<small>${esc(l.verificada_por || "")}<br>${fechaHora(l.verificada_en)}</small>`
+                    : ""
+                }</label></td>
+              <td><span style="font-family:var(--mono);font-size:14px;white-space:nowrap">${esc(
+                numeroLegible(l.numero)
+              )}</span>${l.activo_codigo ? `<div><span class="codigo">${esc(l.activo_codigo)}</span></div>` : ""}</td>
+              <td>${l.titular ? esc(l.titular) : tenue("Sin titular")}</td>
+              <td>${esc(l.sucursal || "—")}</td>
+              <td>${esc(l.departamento || "—")}</td>
+              <td><a class="boton btn-secundario btn-mini btn-whatsapp" href="${enlaceWhatsApp(l.numero)}" target="_blank" rel="noopener"
+                     data-enviar="${l.id}">${icono("whatsapp")}Enviar WhatsApp</a>
+                ${
+                  l.enviado_en
+                    ? `<div style="font-size:13px;color:var(--texto-tenue);margin-top:4px">
+                         Enviado ${fechaHora(l.enviado_en)}</div>`
+                    : ""
+                }</td>
+              <td>${l.observacion ? esc(l.observacion) : "—"}</td>
+              ${
+                editable
+                  ? `<td><div style="display:flex;gap:6px;justify-content:flex-end">
+                      <button class="btn-secundario btn-mini" data-observacion="${l.id}">Observación</button>
+                    </div></td>`
+                  : ""
+              }
+            </tr>`
+          )
+          .join("")}</tbody></table></div>`
+    : `<div class="panel"><div class="vacio">Sin números.</div></div>`;
+
+  const linea = (id) => lista.find((l) => String(l.id) === String(id));
+  const guardar = async (l, cambios) => {
+    const r = await api(`/api/verificacion-numeros/${l.id}/${periodo}`, {
+      method: "PUT",
+      body: JSON.stringify(cambios),
+      silencioso: true,
+    });
+    Object.assign(l, r);
+    repintar();
+  };
+
+  if (!editable) return;
+  document.querySelectorAll("#tabla-verificacion [data-enviar]").forEach((a) => {
+    a.addEventListener("click", () => {
+      guardar(linea(a.dataset.enviar), { enviado: true }).catch((err) => toast(err.message, "error"));
+    });
+  });
+  document.querySelectorAll("#tabla-verificacion [data-verificar]").forEach((ch) => {
+    ch.onchange = async () => {
+      const l = linea(ch.dataset.verificar);
+      try {
+        await guardar(l, { verificada: ch.checked });
+      } catch (err) {
+        ch.checked = !ch.checked;
+        toast(err.message, "error");
+      }
+    };
+  });
+  document.querySelectorAll("#tabla-verificacion [data-observacion]").forEach((b) => {
+    b.onclick = async () => {
+      const l = linea(b.dataset.observacion);
+      const texto = await pedirTexto(`Observación · ${numeroLegible(l.numero)}`, "Observación", l.observacion || "");
+      if (texto === null) return;
+      try {
+        await guardar(l, { observacion: texto });
+        toast("Observación guardada");
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+  });
+}
+
+function modalNumero() {
+  abrirModal(
+    "Agregar número",
+    `<form id="form-numero">
+      <div class="rejilla">
+        <div class="campo"><label>Número *</label>
+          <input name="numero" required inputmode="numeric" maxlength="20"></div>
+        <div class="campo"><label>Titular</label>
+          <input name="titular" maxlength="180"></div>
+        <div class="campo"><label>Sucursal</label>
+          <input name="sucursal" maxlength="80"></div>
+        <div class="campo"><label>Departamento</label>
+          <input name="departamento" maxlength="80"></div>
+      </div>
+    </form>`,
+    `<button class="btn-secundario" id="num-cancelar">Cancelar</button>
+     <button class="btn-primario" id="num-guardar">Guardar</button>`
+  );
+
+  $("#num-cancelar").onclick = cerrarModal;
+  $("#num-guardar").onclick = async () => {
+    const form = $("#form-numero");
+    if (!form.reportValidity()) return;
+    try {
+      await api("/api/verificacion-numeros", {
+        method: "POST",
+        body: JSON.stringify(Object.fromEntries(new FormData(form))),
+      });
+      cerrarModal();
+      toast("Número agregado");
+      verVerificacion();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
+// ---------------------------------------------------------------- catálogos
+
+const CATALOGOS = {
+  sucursales: { titulo: "Sucursales", nuevo: "Nueva sucursal", clave: true },
+  departamentos: { titulo: "Departamentos", nuevo: "Nuevo departamento", clave: true },
+  bodegas: { titulo: "Locaciones", nuevo: "Nueva locación", clave: false, sucursal: true },
+  sistemas: { titulo: "Sistemas internos", nuevo: "Nuevo sistema", clave: true, propio: true },
+};
+
+async function verCatalogos(entidad = "sucursales") {
+  $("#vista").innerHTML = `
+    <div class="encabezado">
+      <div><h2>Catálogos</h2><p>Sucursales, departamentos y locaciones</p></div>
+      ${puedeEditar() ? `<button class="btn-primario" id="btn-nuevo-cat">${CATALOGOS[entidad].nuevo}</button>` : ""}
+    </div>
+    <div class="filtros">
+      <div class="campo"><label>Catálogo</label>
+        <select id="c-entidad">
+          ${Object.entries(CATALOGOS)
+            .map(
+              ([k, v]) => `<option value="${k}" ${k === entidad ? "selected" : ""}>${v.titulo}</option>`
+            )
+            .join("")}
+        </select></div>
+    </div>
+    <div id="tabla-catalogo"></div>`;
+
+  $("#c-entidad").onchange = () => {
+    const actual = $("#c-entidad").value;
+    if (puedeEditar()) $("#btn-nuevo-cat").textContent = CATALOGOS[actual].nuevo;
+    cargarCatalogo(actual);
+  };
+  if (puedeEditar())
+    $("#btn-nuevo-cat").onclick = () => modalCatalogo($("#c-entidad").value);
+  cargarCatalogo(entidad);
+}
+
+async function cargarCatalogo(entidad) {
+  const cfg = CATALOGOS[entidad];
+  if (cfg.propio) return cargarSistemas();
+  const filas = await api(`/api/catalogos/${entidad}/uso`);
+
+  $("#tabla-catalogo").innerHTML = filas.length
+    ? `<div class="tabla-wrap"><table>
+        <thead><tr>
+          ${cfg.clave ? "<th>Clave</th>" : ""}
+          <th>Nombre</th>
+          ${cfg.sucursal ? "<th>Sucursal</th>" : ""}
+          <th class="num">Empleados</th><th class="num">Activos</th>
+          <th>Estado</th><th></th>
+        </tr></thead>
+        <tbody>${filas
+          .map(
+            (f) => `<tr>
+            ${cfg.clave ? `<td class="codigo">${esc(f.clave || "—")}</td>` : ""}
+            <td>${esc(f.nombre)}</td>
+            ${cfg.sucursal ? `<td>${esc(f.sucursal || "—")}</td>` : ""}
+            <td class="num">${f.empleados}</td>
+            <td class="num">${f.activos}</td>
+            <td><span class="insignia ${f.activo ? "ok" : "neutra"}">${
+              f.activo ? "Activo" : "Oculto"
+            }</span></td>
+            <td style="display:flex;gap:6px;flex-wrap:wrap">
+              ${
+                puedeEditar()
+                  ? `<button class="btn-secundario btn-mini" data-editar="${f.id}">Editar</button>
+                     <button class="btn-secundario btn-mini" data-alternar="${f.id}">${
+                       f.activo ? "Ocultar" : "Activar"
+                     }</button>
+                     <button class="btn-peligro btn-mini" data-borrar="${f.id}"
+                       ${f.en_uso ? "disabled title='Está en uso'" : ""}>Eliminar</button>`
+                  : ""
+              }
+            </td></tr>`
+          )
+          .join("")}</tbody></table></div>`
+    : `<div class="panel"><div class="vacio">Este catálogo está vacío.</div></div>`;
+
+  if (!puedeEditar()) return;
+  document.querySelectorAll("[data-editar]").forEach((b) => {
+    b.onclick = () =>
+      modalCatalogo(entidad, filas.find((f) => String(f.id) === b.dataset.editar));
+  });
+  document.querySelectorAll("[data-alternar]").forEach((b) => {
+    b.onclick = async () => {
+      try {
+        await api(`/api/catalogos/${entidad}/${b.dataset.alternar}/activo`, { method: "POST" });
+        await recargarCatalogos();
+        cargarCatalogo(entidad);
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+  });
+  document.querySelectorAll("[data-borrar]").forEach((b) => {
+    if (b.disabled) return;
+    b.onclick = async () => {
+      const f = filas.find((x) => String(x.id) === b.dataset.borrar);
+      if (await confirmar(`¿Eliminar "${f.nombre}"?`)) {
+        try {
+          await api(`/api/catalogos/${entidad}/${f.id}`, { method: "DELETE" });
+          toast("Registro eliminado");
+          await recargarCatalogos();
+          cargarCatalogo(entidad);
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      }
+    };
+  });
+}
+
+async function cargarSistemas() {
+  const filas = await api("/api/sistemas");
+
+  $("#tabla-catalogo").innerHTML = filas.length
+    ? `<div class="tabla-wrap"><table>
+        <thead><tr><th>Clave</th><th>Nombre</th><th>Descripción</th>
+        <th class="num">Orden</th><th class="num">Entregados</th><th>Estado</th><th></th></tr></thead>
+        <tbody>${filas
+          .map(
+            (f) => `<tr>
+            <td class="codigo">${esc(f.clave)}</td>
+            <td>${esc(f.nombre)}</td>
+            <td>${esc(f.descripcion || "—")}</td>
+            <td class="num">${f.orden}</td>
+            <td class="num">${f.entregados}</td>
+            <td><span class="insignia ${f.activo ? "ok" : "neutra"}">${
+              f.activo ? "Activo" : "Oculto"
+            }</span></td>
+            <td style="display:flex;gap:6px;flex-wrap:wrap">
+              ${
+                puedeEditar()
+                  ? `<button class="btn-secundario btn-mini" data-editar-sis="${f.id}">Editar</button>
+                     <button class="btn-peligro btn-mini" data-borrar-sis="${f.id}"
+                       ${f.entregados ? "disabled title='Hay accesos registrados'" : ""}>Eliminar</button>`
+                  : ""
+              }
+            </td></tr>`
+          )
+          .join("")}</tbody></table></div>`
+    : `<div class="panel"><div class="vacio">No hay sistemas registrados.</div></div>`;
+
+  if (!puedeEditar()) return;
+  document.querySelectorAll("[data-editar-sis]").forEach((b) => {
+    b.onclick = () => modalSistema(filas.find((f) => String(f.id) === b.dataset.editarSis));
+  });
+  document.querySelectorAll("[data-borrar-sis]").forEach((b) => {
+    if (b.disabled) return;
+    b.onclick = async () => {
+      const f = filas.find((x) => String(x.id) === b.dataset.borrarSis);
+      if (await confirmar(`¿Eliminar el sistema "${f.nombre}"?`)) {
+        try {
+          await api(`/api/sistemas/${f.id}`, { method: "DELETE" });
+          toast("Sistema eliminado");
+          await recargarCatalogos();
+          cargarSistemas();
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      }
+    };
+  });
+}
+
+function modalSistema(f = null) {
+  abrirModal(
+    f ? `Editar ${esc(f.nombre)}` : "Nuevo sistema interno",
+    `<form id="form-sis">
+      <div class="rejilla">
+        <div class="campo"><label>Nombre *</label>
+          <input name="nombre" required value="${esc(f?.nombre || "")}"
+                 placeholder="SISTEMA DE GASTOS"></div>
+        <div class="campo"><label>Clave *</label>
+          <input name="clave" required maxlength="20" value="${esc(f?.clave || "")}"
+                 placeholder="GASTOS"></div>
+        <div class="campo"><label>Orden en el checklist</label>
+          <input name="orden" type="number" value="${f?.orden ?? 0}"></div>
+      </div>
+      <div class="campo"><label>Descripción</label>
+        <input name="descripcion" value="${esc(f?.descripcion || "")}"></div>
+    </form>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Guardar</button>`
+  );
+
+  $("#cancelar").onclick = cerrarModal;
+  $("#guardar").onclick = async () => {
+    const form = $("#form-sis");
+    if (!form.reportValidity()) return;
+    const datos = recolectar(form);
+    datos.orden = Number(datos.orden || 0);
+    try {
+      await api(f ? `/api/sistemas/${f.id}` : "/api/sistemas", {
+        method: f ? "PUT" : "POST",
+        body: JSON.stringify(datos),
+      });
+      cerrarModal();
+      toast(f ? "Sistema actualizado" : "Sistema creado");
+      await recargarCatalogos();
+      cargarSistemas();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
+function modalCatalogo(entidad, f = null) {
+  if (CATALOGOS[entidad].propio) return modalSistema(f);
+  const cfg = CATALOGOS[entidad];
+  abrirModal(
+    f ? `Editar ${esc(f.nombre)}` : cfg.nuevo,
+    `<form id="form-cat">
+      <div class="campo"><label>Nombre *</label>
+        <input name="nombre" required value="${esc(f?.nombre || "")}"></div>
+      ${
+        cfg.clave
+          ? `<div class="campo"><label>Clave *</label>
+               <input name="clave" required maxlength="12" value="${esc(f?.clave || "")}"
+                      placeholder="TOL, FIN, RH…"></div>`
+          : ""
+      }
+      ${
+        cfg.sucursal
+          ? `<div class="campo"><label>Sucursal *</label>
+               <select name="sucursal_id" required>${opciones(
+                 estado.catalogos.sucursales,
+                 f?.sucursal_id
+               )}</select></div>`
+          : ""
+      }
+    </form>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Guardar</button>`
+  );
+
+  $("#cancelar").onclick = cerrarModal;
+  $("#guardar").onclick = async () => {
+    const form = $("#form-cat");
+    if (!form.reportValidity()) return;
+    try {
+      await api(
+        f ? `/api/catalogos/${entidad}/${f.id}` : `/api/catalogos/${entidad}`,
+        { method: f ? "PUT" : "POST", body: JSON.stringify(recolectar(form)) }
+      );
+      cerrarModal();
+      toast(f ? "Registro actualizado" : "Registro creado");
+      await recargarCatalogos();
+      cargarCatalogo(entidad);
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
