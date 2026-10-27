@@ -728,3 +728,369 @@ function activarBotonesDocumento(asignaciones) {
   });
 }
 
+// ---------------------------------------------------------------- sesión
+
+function mostrarLogin() {
+  $("#login").hidden = false;
+  $("#app").hidden = true;
+}
+
+async function iniciarSesion(evento) {
+  evento.preventDefault();
+  $("#error-login").innerHTML = "";
+  try {
+    estado.usuario = await api("/api/login", {
+      method: "POST",
+      body: JSON.stringify({
+        username: $("#usuario").value.trim(),
+        password: $("#password").value,
+      }),
+    });
+    if (estado.usuario.password_por_defecto) return cambioObligatorio();
+    await arrancar();
+  } catch (e) {
+    $("#error-login").innerHTML = `<div class="aviso error">${esc(e.message)}</div>`;
+  }
+}
+
+const ROL_TEXTO = { ADMIN: "Administrador", CAPTURA: "Captura", CONSULTA: "Consulta" };
+
+// Foto de perfil si la tiene; si no, las iniciales
+function pintarAvatar(el, u) {
+  el.classList.toggle("con-foto", Boolean(u.foto));
+  el.style.backgroundImage = u.foto ? `url("/api/adjuntos/${u.foto}")` : "";
+  el.textContent = u.foto ? "" : iniciales(u.nombre);
+}
+
+const htmlAvatar = (u, clase = "") =>
+  u.foto
+    ? `<span class="avatar con-foto ${clase}" style="background-image:url('/api/adjuntos/${esc(u.foto)}')"></span>`
+    : `<span class="avatar ${clase}">${esc(iniciales(u.nombre))}</span>`;
+
+function iniciales(nombre) {
+  return (nombre || "?")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((p) => p[0])
+    .join("")
+    .toUpperCase();
+}
+
+async function arrancar() {
+  $("#login").hidden = true;
+  $("#app").hidden = false;
+  const u = estado.usuario;
+  $("#sesion-nombre").textContent = u.nombre;
+  $("#sesion-rol").textContent = ROL_TEXTO[u.rol] || u.rol;
+  $("#nombre-barra").textContent = u.nombre.split(" ")[0];
+  $("#nombre-menu-usuario").textContent = u.nombre;
+  $("#rol-menu-usuario").textContent = `${u.username} · ${ROL_TEXTO[u.rol] || u.rol}`;
+  ["#avatar-menu", "#avatar-barra", "#avatar-menu-usuario"].forEach((s) => pintarAvatar($(s), u));
+  $("#nav-usuarios").hidden = !esAdmin();
+  $("#nav-contrasenas").hidden = !puedeEditar();
+  await recargarCatalogos();
+  await refrescarContadorAlertas();
+  irA(estado.vista);
+  avisarVencimientos();
+}
+
+// Una vez por sesión: licencias que vencen en 60 días o menos
+function avisarVencimientos() {
+  const a = estado.avisos;
+  if (!a || !a.porVencer) return;
+  try {
+    if (sessionStorage.getItem("aviso-vencimientos")) return;
+    sessionStorage.setItem("aviso-vencimientos", "1");
+  } catch (_) {}
+  const cuando = a.proxima < 0 ? "una ya venció" : `la más próxima en ${a.proxima} día(s)`;
+  toast(`${a.porVencer} familia(s) de licencias vencen en 60 días o menos · ${cuando}`,
+    a.proxima <= 30 ? "error" : "aviso", () => irA("alertas"));
+}
+
+async function recargarCatalogos() {
+  estado.catalogos = await api("/api/catalogos");
+}
+
+async function refrescarContadorAlertas() {
+  try {
+    const [alertas, notas, notif] = await Promise.all([
+      api("/api/alertas"),
+      api("/api/notas"),
+      api("/api/notificaciones"),
+    ]);
+    const cnf = $("#cont-notif");
+    cnf.textContent = notif.length;
+    cnf.hidden = notif.length === 0;
+    const criticas = alertas.filter((a) => a.severidad === "critica").length;
+    const contador = $("#cont-alertas");
+    contador.textContent = criticas;
+    contador.hidden = criticas === 0;
+
+    const abiertas = notas.filter((n) => n.estado !== "RESUELTA").length;
+    const cn = $("#cont-notas");
+    cn.textContent = abiertas;
+    cn.hidden = abiertas === 0;
+
+    const porVencer = alertas.filter((a) => a.tipo === "licencia_por_vencer");
+    const porVencerMedias = porVencer.filter((a) => a.severidad !== "critica").length;
+    estado.avisos = {
+      notif: notif.length, criticas, notas: abiertas, alertas: alertas.length,
+      porVencer: porVencer.length,
+      proxima: porVencer.reduce((m, a) => Math.min(m, a.dias), Infinity),
+    };
+    const total = notif.length + criticas + porVencerMedias;
+    const campana = $("#cont-campana");
+    campana.textContent = total > 99 ? "99+" : total;
+    campana.hidden = total === 0;
+  } catch (_) {}
+}
+
+// ---------------------------------------------------------------- barra superior
+
+const TEMAS = {
+  neon: { nombre: "Noche", muestras: ["#00D1FF", "#FF3D9A", "#1E1A38"] },
+  aurora: { nombre: "Aurora", muestras: ["#00FF9F", "#00B8FF", "#BD00FF"] },
+  carmesi: { nombre: "Carmesí", muestras: ["#55EAD4", "#C5003C", "#F3E600"] },
+  grafito: { nombre: "Grafito", muestras: ["#46EBEB", "#FB0A26", "#192F22"] },
+  claro: { nombre: "Claro", muestras: ["#0284C7", "#D6246E", "#F1F4F9"] },
+};
+
+function guardarPreferencia(clave, valor) {
+  try {
+    localStorage.setItem(clave, valor);
+  } catch (_) {}
+}
+
+function aplicarTema(clave) {
+  document.documentElement.dataset.tema = clave;
+  guardarPreferencia("tema", clave);
+  cerrarFlotantes();
+  if (estado.usuario) irA(estado.vista);
+}
+
+function cerrarFlotantes(excepto = null) {
+  document.querySelectorAll(".flotante").forEach((f) => {
+    if (f !== excepto) f.hidden = true;
+  });
+}
+
+function alternarFlotante(id, pintar) {
+  const f = $(id);
+  const abrir = f.hidden;
+  cerrarFlotantes(f);
+  if (abrir && pintar) pintar(f);
+  f.hidden = !abrir;
+}
+
+function pintarMenuTema(f) {
+  const actual = document.documentElement.dataset.tema || "neon";
+  f.innerHTML =
+    `<div class="flotante-titulo">Tema de color</div>` +
+    Object.entries(TEMAS)
+      .map(
+        ([clave, t]) => `<button class="opcion ${clave === actual ? "activa" : ""}" data-elegir-tema="${clave}">
+          ${clave === actual ? icono("check") : '<svg viewBox="0 0 24 24"></svg>'}
+          <span>${esc(t.nombre)}</span>
+          <span class="muestras">${t.muestras.map((c) => `<i style="background:${c}"></i>`).join("")}</span>
+        </button>`
+      )
+      .join("");
+  f.querySelectorAll("[data-elegir-tema]").forEach(
+    (b) => (b.onclick = () => aplicarTema(b.dataset.elegirTema))
+  );
+}
+
+function pintarMenuCampana(f) {
+  const a = estado.avisos || { notif: 0, criticas: 0, notas: 0, alertas: 0, porVencer: 0 };
+  const fila = (vista, ico, titulo, detalle, cifra) => `
+    <button class="opcion" data-ir="${vista}">
+      <span class="ico">${icono(ico)}</span>
+      <span class="texto-opcion"><b>${titulo}</b><small>${detalle}</small></span>
+      <span class="cifra-opcion">${cifra}</span>
+    </button>`;
+  f.innerHTML =
+    `<div class="flotante-titulo">Avisos</div>` +
+    fila("licencias", "calendario", "Licencias por vencer",
+      a.porVencer
+        ? `La más próxima ${a.proxima < 0 ? "ya venció" : `en ${a.proxima} día(s)`}`
+        : "Ninguna en los próximos 60 días",
+      a.porVencer) +
+    fila("notificaciones", "documento", "Responsivas por recibir", "Sin enviar o en espera de firma", a.notif) +
+    fila("alertas", "alertas", "Alertas críticas", `${a.alertas} alertas en total`, a.criticas) +
+    fila("notas", "notas", "Notas abiertas", "Pendientes del equipo", a.notas);
+  f.querySelectorAll("[data-ir]").forEach((b) => {
+    b.onclick = () => {
+      cerrarFlotantes();
+      irA(b.dataset.ir);
+    };
+  });
+}
+
+let temporizadorBusqueda = null;
+let resultadosBusqueda = [];
+
+async function buscarGlobal() {
+  const q = $("#busqueda-global").value.trim();
+  const caja = $("#resultados-busqueda");
+  if (q.length < 2) {
+    caja.hidden = true;
+    return;
+  }
+  const consulta = encodeURIComponent(q);
+  const [personas, activos] = await Promise.all([
+    api(`/api/empleados?q=${consulta}`, { silencioso: true }).catch(() => []),
+    api(`/api/activos?q=${consulta}`, { silencioso: true }).catch(() => []),
+  ]);
+  if ($("#busqueda-global").value.trim() !== q) return;
+
+  resultadosBusqueda = [
+    ...personas.slice(0, 5).map((e) => ({
+      grupo: "Personas",
+      ico: "empleados",
+      titulo: e.nombre_completo,
+      detalle: [e.codigo, e.departamento, e.sucursal].filter(Boolean).join(" · "),
+      abrir: () => verFichaEmpleado(e.id),
+    })),
+    ...activos.slice(0, 7).map((a) => ({
+      grupo: "Activos y servicios",
+      ico: ICONO_TIPO[a.tipo] || "equipos",
+      titulo: `${a.codigo} · ${a.descripcion || TIPOS[a.tipo]}`,
+      detalle: `${TIPOS[a.tipo] || a.tipo} · ${a.asignado_a ? a.asignado_a.empleado : "Sin asignar"}`,
+      abrir: () => verFichaActivo(a.id, SECCION_TIPO[a.tipo] || "equipos"),
+    })),
+  ];
+
+  let grupo = "";
+  caja.innerHTML = resultadosBusqueda.length
+    ? resultadosBusqueda
+        .map((r, i) => {
+          const cab = r.grupo !== grupo ? `<div class="flotante-titulo">${r.grupo}</div>` : "";
+          grupo = r.grupo;
+          return `${cab}<button class="opcion ${i === 0 ? "enfocada" : ""}" data-res="${i}">
+            <span class="ico">${icono(r.ico)}</span>
+            <span class="texto-opcion"><b>${esc(r.titulo)}</b><small>${esc(r.detalle)}</small></span>
+          </button>`;
+        })
+        .join("")
+    : `<div class="vacio">Sin resultados para «${esc(q)}».</div>`;
+  caja.hidden = false;
+  caja.querySelectorAll("[data-res]").forEach((b) => {
+    b.onclick = () => abrirResultado(Number(b.dataset.res));
+  });
+}
+
+function abrirResultado(i) {
+  const r = resultadosBusqueda[i];
+  if (!r) return;
+  $("#resultados-busqueda").hidden = true;
+  $("#busqueda-global").value = "";
+  $("#busqueda-global").blur();
+  r.abrir();
+}
+
+function moverSeleccion(paso) {
+  const opciones = [...document.querySelectorAll("#resultados-busqueda [data-res]")];
+  if (!opciones.length) return;
+  const actual = opciones.findIndex((o) => o.classList.contains("enfocada"));
+  const siguiente = (actual + paso + opciones.length) % opciones.length;
+  opciones.forEach((o, i) => o.classList.toggle("enfocada", i === siguiente));
+  opciones[siguiente].scrollIntoView({ block: "nearest" });
+}
+
+function iniciarBarraSuperior() {
+  const entrada = $("#busqueda-global");
+  entrada.oninput = () => {
+    clearTimeout(temporizadorBusqueda);
+    temporizadorBusqueda = setTimeout(buscarGlobal, 220);
+  };
+  entrada.onfocus = () => {
+    if (entrada.value.trim().length >= 2) buscarGlobal();
+  };
+  entrada.onkeydown = (e) => {
+    if (e.key === "ArrowDown") { e.preventDefault(); moverSeleccion(1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); moverSeleccion(-1); }
+    else if (e.key === "Enter") {
+      const enfocada = $("#resultados-busqueda .enfocada");
+      if (enfocada) abrirResultado(Number(enfocada.dataset.res));
+    }
+  };
+
+  $("#btn-tema").onclick = () => alternarFlotante("#menu-tema", pintarMenuTema);
+  $("#btn-campana").onclick = () => alternarFlotante("#menu-campana", pintarMenuCampana);
+  $("#btn-usuario").onclick = () => alternarFlotante("#menu-usuario");
+  $("#btn-mi-perfil").onclick = () => {
+    cerrarFlotantes();
+    modalPerfil();
+  };
+  $("#btn-mi-password").onclick = () => {
+    cerrarFlotantes();
+    modalPassword();
+  };
+
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest(".ancla, .buscador-global")) cerrarFlotantes();
+  });
+  document.addEventListener("keydown", (e) => {
+    const escribiendo = /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || "");
+    if (e.key === "/" && !escribiendo && estado.usuario && !$("#modal").innerHTML) {
+      e.preventDefault();
+      entrada.focus();
+    }
+    if (e.key === "Escape") cerrarFlotantes();
+  });
+
+  // Título y ruta de la barra según el grupo del menú
+  let grupo = "";
+  estado.titulos = {};
+  document.querySelectorAll("#nav > *").forEach((el) => {
+    if (el.classList.contains("nav-grupo")) grupo = el.textContent.trim();
+    else if (el.dataset.vista) {
+      const texto = el.querySelector("span").textContent.trim();
+      estado.titulos[el.dataset.vista] = { texto, grupo };
+      el.title = texto;
+    }
+  });
+}
+
+// ---------------------------------------------------------------- navegación
+
+function menuMovil(abrir) {
+  document.body.classList.toggle("menu-abierto", abrir);
+  $("#btn-menu").setAttribute("aria-expanded", String(abrir));
+}
+
+function irA(vista) {
+  if (vista === "contrasenas" && !puedeEditar()) vista = "tablero";
+  estado.vista = vista;
+  menuMovil(false);
+  cerrarFlotantes();
+  const titulo = estado.titulos?.[vista];
+  if (titulo) {
+    $("#barra-titulo").textContent = titulo.texto;
+    $("#barra-migas").textContent = `Panel · ${titulo.grupo} · ${titulo.texto}`;
+    document.title = `${titulo.texto} — Panel de control TI`;
+  }
+  document
+    .querySelectorAll("#nav button")
+    .forEach((b) => b.classList.toggle("activo", b.dataset.vista === vista));
+
+  if (vista === "licencias") return verLicencias();
+  if (vista === "impresoras") return verImpresoras();
+  if (vista === "contrasenas") return verContrasenas();
+  if (SECCIONES[vista]) return verSeccion(vista);
+  ({
+    tablero: verTablero,
+    empleados: verEmpleados,
+    auditorias: verAuditorias,
+    verificacion: verVerificacion,
+    notificaciones: verNotificaciones,
+    notas: verNotas,
+    alertas: verAlertas,
+    reportes: verReportes,
+    catalogos: verCatalogos,
+    usuarios: verUsuarios,
+    bitacora: verBitacora,
+  })[vista]();
+}
+
