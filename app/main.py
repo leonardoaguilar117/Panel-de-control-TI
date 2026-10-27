@@ -2518,3 +2518,777 @@ def exportar_excel(db: Session = Depends(obtener_sesion), _=Depends(usuario_actu
     )
 
 
+# --------------------------------------------------------------------------
+# Usuarios del sistema y bitacora
+# --------------------------------------------------------------------------
+
+
+def id_admin_principal(db: Session) -> int | None:
+    """El primer administrador creado. Nadie más puede modificarlo ni otorgar el rol ADMIN."""
+    return (
+        db.query(func.min(Usuario.id)).filter(Usuario.rol == RolUsuario.ADMIN).scalar()
+    )
+
+
+@app.get("/api/usuarios")
+def listar_usuarios(db: Session = Depends(obtener_sesion), _=Depends(requiere_admin)):
+    principal = id_admin_principal(db)
+    return [
+        {
+            "id": u.id,
+            "username": u.username,
+            "nombre": u.nombre,
+            "rol": u.rol.value,
+            "activo": u.activo,
+            "ultimo_acceso": u.ultimo_acceso,
+            "creado_en": u.creado_en,
+            "principal": u.id == principal,
+            "foto": u.foto,
+            "correo": u.correo,
+            "puesto": u.puesto,
+        }
+        for u in db.query(Usuario).order_by(Usuario.id)
+    ]
+
+
+@app.post("/api/usuarios")
+def crear_usuario(
+    datos: schemas.UsuarioIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_admin),
+):
+    if datos.rol == RolUsuario.ADMIN and usuario.id != id_admin_principal(db):
+        raise HTTPException(403, "Sólo el administrador principal puede crear administradores")
+    nuevo = Usuario(
+        username=datos.username.strip().lower(),
+        nombre=datos.nombre,
+        password_hash=hashear_password(datos.password),
+        rol=datos.rol,
+    )
+    db.add(nuevo)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Ese nombre de usuario ya existe")
+    registrar(db, usuario, "CREAR", "usuario", nuevo.id, nuevo.username)
+    db.commit()
+    return {"id": nuevo.id, "username": nuevo.username}
+
+
+@app.put("/api/usuarios/{usuario_id}")
+def editar_usuario(
+    usuario_id: int,
+    datos: schemas.UsuarioEditarIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_admin),
+):
+    objetivo = db.get(Usuario, usuario_id)
+    if objetivo is None:
+        raise HTTPException(404, "Usuario no encontrado")
+
+    principal = id_admin_principal(db)
+    soy_principal = usuario.id == principal
+    if objetivo.id == usuario.id:
+        raise HTTPException(400, "Tu propia cuenta se administra desde «Cambiar contraseña»")
+    if objetivo.id == principal:
+        raise HTTPException(403, "El administrador principal no puede modificarse")
+    if not soy_principal and (objetivo.rol == RolUsuario.ADMIN or datos.rol == RolUsuario.ADMIN):
+        raise HTTPException(403, "Sólo el administrador principal gestiona administradores")
+
+    objetivo.nombre = datos.nombre
+    objetivo.rol = datos.rol
+    objetivo.activo = datos.activo
+    if datos.password:
+        objetivo.password_hash = hashear_password(datos.password)
+    if not datos.activo or datos.password:
+        db.query(Sesion).filter(Sesion.usuario_id == objetivo.id).delete()
+
+    registrar(
+        db, usuario, "EDITAR", "usuario", objetivo.id,
+        f"{objetivo.username} · {datos.rol.value} · {'activo' if datos.activo else 'inactivo'}",
+    )
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/bitacora")
+def ver_bitacora(
+    limite: int = Query(100, ge=1, le=500),
+    db: Session = Depends(obtener_sesion),
+    _=Depends(usuario_actual),
+):
+    return [
+        {
+            "id": b.id,
+            "fecha": b.fecha,
+            "usuario": b.usuario_nombre,
+            "accion": b.accion,
+            "entidad": b.entidad,
+            "entidad_id": b.entidad_id,
+            "detalle": b.detalle,
+        }
+        for b in db.query(Bitacora).order_by(Bitacora.fecha.desc()).limit(limite)
+    ]
+
+
+
+# --------------------------------------------------------------------------
+# CRUD de catalogos
+# --------------------------------------------------------------------------
+
+MODELOS_CATALOGO = {
+    "sucursales": Sucursal,
+    "departamentos": Departamento,
+    "bodegas": Bodega,
+    "plantas": Planta,
+}
+
+
+@app.get("/api/catalogos/{entidad}/uso")
+def uso_catalogo(
+    entidad: str, db: Session = Depends(obtener_sesion), _=Depends(usuario_actual)
+):
+    """Cuántos empleados y activos dependen de cada entrada del catálogo."""
+    if entidad not in MODELOS_CATALOGO:
+        raise HTTPException(404, "Catálogo desconocido")
+
+    Modelo = MODELOS_CATALOGO[entidad]
+    campo_emp = {
+        "sucursales": Empleado.sucursal_id,
+        "departamentos": Empleado.departamento_id,
+        "bodegas": Empleado.bodega_id,
+        "plantas": Empleado.planta_id,
+    }[entidad]
+    salida = []
+    for registro in db.query(Modelo).order_by(Modelo.nombre).all():
+        empleados = db.query(func.count(Empleado.id)).filter(campo_emp == registro.id).scalar()
+        # Los activos no tienen ubicación propia: se cuentan por la persona que los tiene
+        activos = (
+            db.query(func.count(Asignacion.id))
+            .join(Empleado, Empleado.id == Asignacion.empleado_id)
+            .filter(campo_emp == registro.id, Asignacion.fecha_devolucion.is_(None))
+            .scalar()
+        )
+        salida.append(
+            {
+                "id": registro.id,
+                "nombre": registro.nombre,
+                "clave": getattr(registro, "clave", None),
+                "sucursal_id": getattr(registro, "sucursal_id", None),
+                "sucursal": registro.sucursal.nombre
+                if entidad == "bodegas" and registro.sucursal
+                else None,
+                "activo": registro.activo,
+                "empleados": empleados,
+                "activos": activos,
+                "en_uso": empleados,
+            }
+        )
+    return salida
+
+
+@app.put("/api/catalogos/{entidad}/{registro_id}")
+def editar_catalogo(
+    entidad: str,
+    registro_id: int,
+    datos: schemas.CatalogoIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    if entidad not in MODELOS_CATALOGO:
+        raise HTTPException(404, "Catálogo desconocido")
+    registro = db.get(MODELOS_CATALOGO[entidad], registro_id)
+    if registro is None:
+        raise HTTPException(404, "Registro no encontrado")
+
+    registro.nombre = datos.nombre.strip().upper()
+    if entidad in ("sucursales", "departamentos"):
+        if not datos.clave:
+            raise HTTPException(400, "La clave es obligatoria")
+        registro.clave = datos.clave.strip().upper()
+    if entidad == "bodegas":
+        registro.sucursal_id = datos.sucursal_id
+
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Ya existe un registro con ese nombre o clave")
+    registrar(db, usuario, "EDITAR", entidad, registro.id, registro.nombre)
+    db.commit()
+    return {"id": registro.id, "nombre": registro.nombre}
+
+
+@app.delete("/api/catalogos/{entidad}/{registro_id}")
+def eliminar_catalogo(
+    entidad: str,
+    registro_id: int,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    """Elimina una entrada del catálogo, sólo si nada depende de ella."""
+    if entidad not in MODELOS_CATALOGO:
+        raise HTTPException(404, "Catálogo desconocido")
+    registro = db.get(MODELOS_CATALOGO[entidad], registro_id)
+    if registro is None:
+        raise HTTPException(404, "Registro no encontrado")
+
+    campo_emp = {
+        "sucursales": Empleado.sucursal_id,
+        "departamentos": Empleado.departamento_id,
+        "bodegas": Empleado.bodega_id,
+        "plantas": Empleado.planta_id,
+    }[entidad]
+    empleados = db.query(func.count(Empleado.id)).filter(campo_emp == registro_id).scalar()
+    if empleados:
+        raise HTTPException(
+            409,
+            f"No se puede eliminar: {empleados} empleado(s) usan este registro. "
+            "Reasígnalos primero o desactívalo.",
+        )
+    if entidad == "departamentos":
+        impresoras = (
+            db.query(func.count(Impresora.id))
+            .filter(Impresora.departamentos.any(Departamento.id == registro_id))
+            .scalar()
+        )
+        if impresoras:
+            raise HTTPException(
+                409, f"No se puede eliminar: {impresoras} impresora(s) usan este departamento"
+            )
+    campo_imp = {
+        "sucursales": Impresora.sucursal_id,
+        "bodegas": Impresora.bodega_id,
+        "plantas": Impresora.planta_id,
+    }.get(entidad)
+    if campo_imp is not None:
+        impresoras = db.query(func.count(Impresora.id)).filter(campo_imp == registro_id).scalar()
+        if impresoras:
+            raise HTTPException(
+                409, f"No se puede eliminar: {impresoras} impresora(s) usan este registro"
+            )
+    if entidad == "sucursales":
+        bodegas = db.query(func.count(Bodega.id)).filter(Bodega.sucursal_id == registro_id).scalar()
+        if bodegas:
+            raise HTTPException(409, f"No se puede eliminar: tiene {bodegas} bodega(s) asociada(s)")
+
+    nombre = registro.nombre
+    db.delete(registro)
+    registrar(db, usuario, "ELIMINAR", entidad, registro_id, nombre)
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/catalogos/{entidad}/{registro_id}/activo")
+def alternar_catalogo(
+    entidad: str,
+    registro_id: int,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    """Activa o desactiva una entrada sin borrarla: deja de ofrecerse al capturar."""
+    if entidad not in MODELOS_CATALOGO:
+        raise HTTPException(404, "Catálogo desconocido")
+    registro = db.get(MODELOS_CATALOGO[entidad], registro_id)
+    if registro is None:
+        raise HTTPException(404, "Registro no encontrado")
+    registro.activo = not registro.activo
+    registrar(
+        db, usuario, "EDITAR", entidad, registro.id,
+        f"{registro.nombre} {'activada' if registro.activo else 'desactivada'}",
+    )
+    db.commit()
+    return {"id": registro.id, "activo": registro.activo}
+
+
+# --------------------------------------------------------------------------
+# Impresoras
+# --------------------------------------------------------------------------
+
+
+def dic_impresora(i: Impresora) -> dict:
+    return {
+        "id": i.id,
+        "numero_serie": i.numero_serie,
+        "propietario": i.propietario.value,
+        "locacion": i.locacion,
+        "departamentos": [{"id": d.id, "nombre": d.nombre} for d in i.departamentos],
+        "departamento_ids": [d.id for d in i.departamentos],
+        "sucursal_id": i.sucursal_id,
+        "sucursal": i.sucursal.nombre if i.sucursal else None,
+        "bodega_id": i.bodega_id,
+        "bodega": i.bodega.nombre if i.bodega else None,
+        "planta_id": i.planta_id,
+        "planta": i.planta.nombre if i.planta else None,
+        "numero_serie_proveedor": i.numero_serie_proveedor,
+        "identificador_proveedor": i.identificador_proveedor,
+    }
+
+
+def _aplicar_impresora(db: Session, impresora: Impresora, datos: schemas.ImpresoraIn) -> None:
+    ids = set(datos.departamento_ids)
+    departamentos = db.query(Departamento).filter(Departamento.id.in_(ids)).all() if ids else []
+    if len(departamentos) != len(ids):
+        raise HTTPException(400, "Alguno de los departamentos no existe")
+    impresora.numero_serie = datos.numero_serie.strip()
+    impresora.propietario = datos.propietario
+    impresora.locacion = (datos.locacion or "").strip() or None
+    impresora.numero_serie_proveedor = (datos.numero_serie_proveedor or "").strip() or None
+    impresora.identificador_proveedor = datos.identificador_proveedor.strip()
+    impresora.departamentos = departamentos
+    impresora.sucursal_id = datos.sucursal_id
+    impresora.bodega_id = datos.bodega_id
+    impresora.planta_id = datos.planta_id
+
+
+@app.get("/api/impresoras")
+def listar_impresoras(
+    q: str | None = Query(None, max_length=100),
+    propietario: PropietarioImpresora | None = None,
+    departamento_id: int | None = None,
+    sucursal_id: int | None = None,
+    bodega_id: int | None = None,
+    planta_id: int | None = None,
+    db: Session = Depends(obtener_sesion),
+    _=Depends(usuario_actual),
+):
+    consulta = db.query(Impresora)
+    if propietario:
+        consulta = consulta.filter(Impresora.propietario == propietario)
+    if departamento_id:
+        consulta = consulta.filter(Impresora.departamentos.any(Departamento.id == departamento_id))
+    if sucursal_id:
+        consulta = consulta.filter(Impresora.sucursal_id == sucursal_id)
+    if bodega_id:
+        consulta = consulta.filter(Impresora.bodega_id == bodega_id)
+    if planta_id:
+        consulta = consulta.filter(Impresora.planta_id == planta_id)
+    if q:
+        patron = patron_busqueda(q)
+        consulta = consulta.filter(
+            or_(
+                func.upper(Impresora.numero_serie).like(patron, escape="\\"),
+                func.upper(Impresora.locacion).like(patron, escape="\\"),
+                func.upper(Impresora.numero_serie_proveedor).like(patron, escape="\\"),
+                func.upper(Impresora.identificador_proveedor).like(patron, escape="\\"),
+            )
+        )
+    return [dic_impresora(i) for i in consulta.order_by(Impresora.numero_serie).all()]
+
+
+@app.post("/api/impresoras")
+def crear_impresora(
+    datos: schemas.ImpresoraIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    impresora = Impresora()
+    _aplicar_impresora(db, impresora, datos)
+    db.add(impresora)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Ya existe una impresora con ese número de serie")
+    registrar(db, usuario, "CREAR", "impresora", impresora.id, impresora.numero_serie)
+    db.commit()
+    return dic_impresora(impresora)
+
+
+@app.put("/api/impresoras/{impresora_id}")
+def editar_impresora(
+    impresora_id: int,
+    datos: schemas.ImpresoraIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    impresora = db.get(Impresora, impresora_id)
+    if impresora is None:
+        raise HTTPException(404, "Impresora no encontrada")
+    _aplicar_impresora(db, impresora, datos)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Ya existe una impresora con ese número de serie")
+    registrar(db, usuario, "EDITAR", "impresora", impresora.id, impresora.numero_serie)
+    db.commit()
+    return dic_impresora(impresora)
+
+
+@app.delete("/api/impresoras/{impresora_id}")
+def eliminar_impresora(
+    impresora_id: int,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    impresora = db.get(Impresora, impresora_id)
+    if impresora is None:
+        raise HTTPException(404, "Impresora no encontrada")
+    serie = impresora.numero_serie
+    db.delete(impresora)
+    registrar(db, usuario, "ELIMINAR", "impresora", impresora_id, serie)
+    db.commit()
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# Contraseñas de redes
+# --------------------------------------------------------------------------
+
+
+def dic_red(r: RedWifi) -> dict:
+    return {
+        "id": r.id,
+        "alcance": r.alcance.value,
+        "ubicacion": r.ubicacion,
+        "ssid": r.ssid,
+        "contrasena": descifrar(r.contrasena),
+        "numero_cuenta": r.numero_cuenta,
+        "proveedor": r.proveedor.value,
+        "actualizado_en": r.actualizado_en,
+    }
+
+
+def _aplicar_red(red: RedWifi, datos: schemas.RedWifiIn) -> None:
+    red.alcance = datos.alcance
+    red.ubicacion = datos.ubicacion.strip()
+    red.ssid = datos.ssid.strip()
+    red.contrasena = cifrar(datos.contrasena)
+    red.numero_cuenta = (datos.numero_cuenta or "").strip() or None
+    red.proveedor = datos.proveedor
+
+
+def _guardar_red(db: Session, usuario: Usuario, red: RedWifi, accion: str) -> dict:
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Esa red ya está registrada en esa ubicación")
+    registrar(db, usuario, accion, "red", red.id, f"{red.ssid} · {red.ubicacion}")
+    db.commit()
+    return dic_red(red)
+
+
+@app.get("/api/redes")
+def listar_redes(
+    alcance: AlcanceRed | None = None,
+    db: Session = Depends(obtener_sesion),
+    _=Depends(requiere_captura),
+):
+    consulta = db.query(RedWifi)
+    if alcance:
+        consulta = consulta.filter(RedWifi.alcance == alcance)
+    return [dic_red(r) for r in consulta.order_by(RedWifi.ubicacion, RedWifi.ssid).all()]
+
+
+@app.post("/api/redes")
+def crear_red(
+    datos: schemas.RedWifiIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_admin),
+):
+    red = RedWifi()
+    _aplicar_red(red, datos)
+    db.add(red)
+    return _guardar_red(db, usuario, red, "CREAR")
+
+
+@app.put("/api/redes/{red_id}")
+def editar_red(
+    red_id: int,
+    datos: schemas.RedWifiIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_admin),
+):
+    red = db.get(RedWifi, red_id)
+    if red is None:
+        raise HTTPException(404, "Red no encontrada")
+    _aplicar_red(red, datos)
+    return _guardar_red(db, usuario, red, "EDITAR")
+
+
+@app.delete("/api/redes/{red_id}")
+def eliminar_red(
+    red_id: int,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_admin),
+):
+    red = db.get(RedWifi, red_id)
+    if red is None:
+        raise HTTPException(404, "Red no encontrada")
+    detalle = f"{red.ssid} · {red.ubicacion}"
+    db.delete(red)
+    registrar(db, usuario, "ELIMINAR", "red", red_id, detalle)
+    db.commit()
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# Notas y pendientes
+# --------------------------------------------------------------------------
+
+
+def dic_nota(n: Nota) -> dict:
+    return {
+        "id": n.id,
+        "titulo": n.titulo,
+        "contenido": n.contenido,
+        "estado": n.estado.value,
+        "prioridad": n.prioridad.value,
+        "empleado_id": n.empleado_id,
+        "empleado": n.empleado.nombre_completo if n.empleado else None,
+        "activo_id": n.activo_id,
+        "activo": n.activo.codigo if n.activo else None,
+        "autor_nombre": n.autor_nombre,
+        "resuelta_por": n.resuelta_por,
+        "resuelta_en": n.resuelta_en,
+        "creado_en": n.creado_en,
+        "actualizado_en": n.actualizado_en,
+    }
+
+
+@app.get("/api/notas")
+def listar_notas(
+    estado: EstadoNota | None = None,
+    empleado_id: int | None = None,
+    activo_id: int | None = None,
+    db: Session = Depends(obtener_sesion),
+    _=Depends(usuario_actual),
+):
+    consulta = db.query(Nota)
+    if estado:
+        consulta = consulta.filter(Nota.estado == estado)
+    if empleado_id:
+        consulta = consulta.filter(Nota.empleado_id == empleado_id)
+    if activo_id:
+        consulta = consulta.filter(Nota.activo_id == activo_id)
+
+    orden_prioridad = {"ALTA": 0, "MEDIA": 1, "BAJA": 2}
+    notas = consulta.order_by(Nota.creado_en.desc()).all()
+    notas.sort(key=lambda n: (n.estado == EstadoNota.RESUELTA, orden_prioridad[n.prioridad.value]))
+    return [dic_nota(n) for n in notas]
+
+
+@app.post("/api/notas")
+def crear_nota(
+    datos: schemas.NotaIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    nota = Nota(
+        **datos.model_dump(), autor_id=usuario.id, autor_nombre=usuario.nombre
+    )
+    db.add(nota)
+    db.flush()
+    registrar(db, usuario, "CREAR", "nota", nota.id, nota.titulo)
+    db.commit()
+    return dic_nota(nota)
+
+
+@app.put("/api/notas/{nota_id}")
+def editar_nota(
+    nota_id: int,
+    datos: schemas.NotaIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    nota = db.get(Nota, nota_id)
+    if nota is None:
+        raise HTTPException(404, "Nota no encontrada")
+
+    era_abierta = nota.estado != EstadoNota.RESUELTA
+    for campo, valor in datos.model_dump().items():
+        setattr(nota, campo, valor)
+    if era_abierta and nota.estado == EstadoNota.RESUELTA:
+        nota.resuelta_por = usuario.nombre
+        nota.resuelta_en = dt.datetime.now(dt.timezone.utc)
+    elif nota.estado != EstadoNota.RESUELTA:
+        nota.resuelta_por = None
+        nota.resuelta_en = None
+
+    registrar(db, usuario, "EDITAR", "nota", nota.id, nota.titulo)
+    db.commit()
+    return dic_nota(nota)
+
+
+@app.delete("/api/notas/{nota_id}")
+def eliminar_nota(
+    nota_id: int,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    nota = db.get(Nota, nota_id)
+    if nota is None:
+        raise HTTPException(404, "Nota no encontrada")
+    titulo = nota.titulo
+    db.delete(nota)
+    registrar(db, usuario, "ELIMINAR", "nota", nota_id, titulo)
+    db.commit()
+    return {"ok": True}
+
+
+
+# --------------------------------------------------------------------------
+# Verificación mensual de números
+# --------------------------------------------------------------------------
+
+
+def _solo_digitos(numero: str) -> str:
+    digitos = re.sub(r"\D", "", numero or "")
+    # Los números de México se guardan a 10 dígitos
+    if len(digitos) == 12 and digitos.startswith("52"):
+        digitos = digitos[2:]
+    return digitos
+
+
+def _sincronizar_lineas(db: Session) -> None:
+    """Toda línea del inventario de telefonía entra a la verificación."""
+    lineas = {l.numero: l for l in db.query(LineaVerificacion).all()}
+    telefonos = (
+        db.query(Activo)
+        .join(DetalleMovil)
+        .filter(Activo.tipo == TipoActivo.TELEFONO, DetalleMovil.numero_telefonico.isnot(None))
+        .all()
+    )
+    for a in telefonos:
+        numero = _solo_digitos(a.detalle_movil.numero_telefonico)
+        if not numero:
+            continue
+        linea = lineas.get(numero)
+        if linea is None:
+            linea = LineaVerificacion(numero=numero, activo_id=a.id)
+            db.add(linea)
+            lineas[numero] = linea
+        elif linea.activo_id is None:
+            linea.activo_id = a.id
+    if db.new or db.dirty:
+        db.commit()
+
+
+def dic_linea(l: LineaVerificacion, v: VerificacionNumero | None, db: Session) -> dict:
+    titular, sucursal, departamento = l.titular, l.sucursal, l.departamento
+    vig = asignacion_vigente(db, l.activo_id) if l.activo_id else None
+    if vig:
+        e = vig.empleado
+        titular = e.nombre_completo
+        sucursal = e.sucursal.nombre if e.sucursal else sucursal
+        departamento = e.departamento.nombre if e.departamento else departamento
+    return {
+        "id": l.id,
+        "numero": l.numero,
+        "titular": titular,
+        "titular_registrado": l.titular,
+        "sucursal": sucursal,
+        "sucursal_registrada": l.sucursal,
+        "departamento": departamento,
+        "departamento_registrado": l.departamento,
+        "activo_id": l.activo_id,
+        "activo_codigo": l.activo.codigo if l.activo else None,
+        "empleado_id": vig.empleado_id if vig else None,
+        "verificada": bool(v and v.verificada),
+        "verificada_por": v.verificada_por if v else None,
+        "verificada_en": v.verificada_en if v else None,
+        "enviado_por": v.enviado_por if v else None,
+        "enviado_en": v.enviado_en if v else None,
+        "observacion": v.observacion if v else None,
+    }
+
+
+def _validar_periodo(periodo: str) -> str:
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", periodo):
+        raise HTTPException(422, "Periodo inválido")
+    return periodo
+
+
+@app.get("/api/verificacion-numeros")
+def listar_verificacion_numeros(
+    periodo: str | None = None,
+    db: Session = Depends(obtener_sesion),
+    _=Depends(usuario_actual),
+):
+    periodo = _validar_periodo(periodo or hoy_local().strftime("%Y-%m"))
+    _sincronizar_lineas(db)
+    verificaciones = {
+        v.linea_id: v
+        for v in db.query(VerificacionNumero).filter(VerificacionNumero.periodo == periodo)
+    }
+    lineas = (
+        db.query(LineaVerificacion)
+        .outerjoin(Activo, LineaVerificacion.activo_id == Activo.id)
+        .filter(or_(Activo.id.is_(None), Activo.estatus != EstatusActivo.BAJA))
+        .all()
+    )
+    filas = [dic_linea(l, verificaciones.get(l.id), db) for l in lineas]
+    filas.sort(key=lambda f: ((f["titular"] or "~").strip().upper(), f["numero"]))
+    return filas
+
+
+def _guardar_linea(db: Session, linea: LineaVerificacion, datos: schemas.LineaVerificacionIn) -> None:
+    numero = _solo_digitos(datos.numero)
+    if len(numero) != 10:
+        raise HTTPException(422, "El número debe tener 10 dígitos")
+    otra = db.query(LineaVerificacion).filter(LineaVerificacion.numero == numero).first()
+    if otra is not None and otra.id != linea.id:
+        raise HTTPException(409, "Ese número ya está en la lista")
+    linea.numero = numero
+    linea.titular = (datos.titular or "").strip() or None
+    linea.sucursal = (datos.sucursal or "").strip() or None
+    linea.departamento = (datos.departamento or "").strip() or None
+
+
+@app.post("/api/verificacion-numeros")
+def crear_linea_verificacion(
+    datos: schemas.LineaVerificacionIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    linea = LineaVerificacion()
+    _guardar_linea(db, linea, datos)
+    db.add(linea)
+    db.flush()
+    registrar(db, usuario, "CREAR", "verificacion", linea.id, linea.numero)
+    db.commit()
+    return {"id": linea.id}
+
+
+@app.put("/api/verificacion-numeros/{linea_id}/{periodo}")
+def marcar_verificacion(
+    linea_id: int,
+    periodo: str,
+    datos: schemas.VerificacionIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    _validar_periodo(periodo)
+    linea = db.get(LineaVerificacion, linea_id)
+    if linea is None:
+        raise HTTPException(404, "Número no encontrado")
+    v = (
+        db.query(VerificacionNumero)
+        .filter(VerificacionNumero.linea_id == linea_id, VerificacionNumero.periodo == periodo)
+        .first()
+    )
+    if v is None:
+        v = VerificacionNumero(linea_id=linea_id, periodo=periodo, verificada=False)
+        db.add(v)
+
+    momento = dt.datetime.now(dt.timezone.utc)
+    if datos.enviado:
+        v.enviado_por = usuario.nombre
+        v.enviado_en = momento
+    if datos.verificada is not None and datos.verificada != v.verificada:
+        v.verificada = datos.verificada
+        v.verificada_por = usuario.nombre if datos.verificada else None
+        v.verificada_en = momento if datos.verificada else None
+        registrar(
+            db, usuario, "EDITAR", "verificacion", linea.id,
+            f"{linea.numero} {'verificado' if datos.verificada else 'sin verificar'} ({periodo})",
+        )
+    if "observacion" in datos.model_fields_set:
+        v.observacion = (datos.observacion or "").strip() or None
+    db.commit()
+    return dic_linea(linea, v, db)
+
+
