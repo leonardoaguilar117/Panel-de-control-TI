@@ -3871,3 +3871,571 @@ async function modalNota(n = null) {
   };
 }
 
+// ---------------------------------------------------------------- auditoría
+
+const TIPOS_AUDITORIA = { CORREO: "Correo", NORTON: "Supervisión" };
+
+const ESTADOS_ITEM = {
+  PENDIENTE: "Pendiente",
+  CONFORME: "Conforme",
+  INCIDENCIA: "Incidencia",
+  NO_APLICA: "No aplica",
+};
+
+async function verAuditorias() {
+  const auditorias = await api("/api/auditorias");
+
+  $("#vista").innerHTML = `
+    <div class="encabezado">
+      <div><h2>Auditoría</h2><p>Revisión semanal de correo y supervisión, como checklist</p></div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn-secundario" id="btn-aud-mensual">Reporte mensual</button>
+        ${
+          esAdmin()
+            ? `<button class="btn-secundario" id="btn-aud-correo">Programar correo</button>
+               <button class="btn-primario" id="btn-aud-norton">Programar supervisión</button>`
+            : ""
+        }
+      </div>
+    </div>
+    ${
+      auditorias.length
+        ? `<div class="tabla-wrap"><table>
+            <thead><tr><th>Semana</th><th>Tipo</th><th>Analista asignado</th><th>Avance</th>
+            <th class="num">Incidencias</th><th>Estado</th></tr></thead>
+            <tbody>${auditorias
+              .map(
+                (a) => `<tr class="clicable" data-id="${a.id}">
+                <td>${fecha(a.fecha_inicio)} — ${fecha(a.fecha_fin)}</td>
+                <td>${TIPOS_AUDITORIA[a.tipo] || a.tipo}</td>
+                <td>${
+                  a.analista
+                    ? `<span class="insignia acento">${esc(a.analista)}</span>`
+                    : '<span style="color:var(--texto-tenue)">Sin asignar</span>'
+                }</td>
+                <td style="min-width:130px">
+                  <div style="font-size:14px">${a.revisados}/${a.total}</div>
+                  <div class="avance"><div style="width:${a.avance}%"></div></div>
+                </td>
+                <td class="num">${
+                  a.incidencias
+                    ? `<span class="insignia peligro">${a.incidencias}</span>`
+                    : '<span style="color:var(--texto-tenue)">0</span>'
+                }</td>
+                <td><span class="insignia ${a.estado === "CERRADA" ? "ok" : "alerta"}">${
+                  a.estado === "CERRADA" ? "Cerrada" : "En proceso"
+                }</span></td></tr>`
+              )
+              .join("")}</tbody></table></div>`
+        : `<div class="panel"><div class="vacio">
+             Aún no hay auditorías programadas.
+           </div></div>`
+    }`;
+
+  $("#btn-aud-mensual").onclick = () => modalReporteMensual(auditorias);
+  if (esAdmin()) {
+    $("#btn-aud-correo").onclick = () => crearAuditoria("CORREO");
+    $("#btn-aud-norton").onclick = () => crearAuditoria("NORTON");
+  }
+  document
+    .querySelectorAll("#vista tr.clicable")
+    .forEach((tr) => (tr.onclick = () => verAuditoria(tr.dataset.id)));
+}
+
+async function crearAuditoria(tipo) {
+  const hoy = hoyISO();
+  const analistas = estado.catalogos.analistas || [];
+
+  abrirModal(
+    `Programar ${tipo === "CORREO" ? "correo" : "supervisión"}`,
+    `<form id="form-aud">
+      <div class="rejilla">
+        <div class="campo"><label>Semana a auditar</label>
+          <input name="fecha" type="date" value="${hoy}"></div>
+        <div class="campo"><label>Analista asignado *</label>
+          <select name="analista_id" required>
+            ${analistas
+              .map((u) => `<option value="${u.id}">${esc(u.nombre)} · ${esc(u.rol)}</option>`)
+              .join("")}
+          </select></div>
+        ${
+          tipo === "NORTON"
+            ? `<div class="campo"><label>Días sin actividad</label>
+                 <input name="dias_sin_actividad" type="number" min="1" max="365" value="7"></div>`
+            : ""
+        }
+      </div>
+    </form>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Programar</button>`
+  );
+
+  $("#cancelar").onclick = cerrarModal;
+  $("#guardar").onclick = async () => {
+    const form = $("#form-aud");
+    if (!form.reportValidity()) return;
+    const datos = recolectar(form);
+    datos.tipo = tipo;
+    if (datos.dias_sin_actividad) datos.dias_sin_actividad = Number(datos.dias_sin_actividad);
+    try {
+      const a = await api("/api/auditorias", { method: "POST", body: JSON.stringify(datos) });
+      cerrarModal();
+      toast(`Auditoría programada para ${a.analista} · ${a.total} puntos`);
+      await refrescarContadorAlertas();
+      verAuditoria(a.id);
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
+async function verAuditoria(id) {
+  const a = await api(`/api/auditorias/${id}`);
+  const cerrada = a.estado === "CERRADA";
+  const editable = puedeEditar() && !cerrada;
+
+  let html = "";
+  let categoriaActual = null;
+  for (const item of a.items) {
+    if (item.categoria !== categoriaActual) {
+      categoriaActual = item.categoria;
+      html += `<div class="grupo-categoria">${esc(categoriaActual)}</div>`;
+    }
+    html += `<div class="item-check ${item.estado}">
+      <div class="texto">
+        <div class="desc">${esc(item.descripcion)}
+          ${item.automatico ? '<span class="insignia acento">Detectado</span>' : ""}</div>
+        ${item.observacion ? `<div class="obs">${esc(item.observacion)}</div>` : ""}
+        ${
+          item.evidencias.length
+            ? `<div class="evidencias">${item.evidencias
+                .map(
+                  (ev) => `<span class="evidencia">
+                    <a href="${esc(ev.url)}" target="_blank" rel="noopener">${esc(ev.nombre)}</a>
+                    ${
+                      editable
+                        ? `<button type="button" class="quitar" data-quitar-evidencia="${ev.id}"
+                             title="Quitar">&times;</button>`
+                        : ""
+                    }</span>`
+                )
+                .join("")}</div>`
+            : ""
+        }
+        ${
+          item.actualizado_por
+            ? `<div style="font-size:13px;color:var(--texto-tenue);margin-top:4px">
+                 ${esc(item.actualizado_por)} · ${fechaHora(item.actualizado_en)}</div>`
+            : ""
+        }
+      </div>
+      ${
+        editable
+          ? `<div class="acciones">
+               ${["CONFORME", "INCIDENCIA", "NO_APLICA"]
+                 .map(
+                   (e) =>
+                     `<button class="btn-secundario ${item.estado === e ? "sel" : ""}"
+                        data-item="${item.id}" data-estado="${e}">${ESTADOS_ITEM[e]}</button>`
+                 )
+                 .join("")}
+               ${
+                 a.tipo !== "NORTON" || item.estado === "INCIDENCIA"
+                   ? `<button class="btn-secundario" data-evidencia="${item.id}">Evidencia</button>`
+                   : ""
+               }
+             </div>`
+          : `<span class="insignia ${
+              item.estado === "CONFORME" ? "ok" : item.estado === "INCIDENCIA" ? "peligro" : "neutra"
+            }">${ESTADOS_ITEM[item.estado]}</span>`
+      }
+    </div>`;
+  }
+
+  abrirModal(
+    `${a.tipo === "CORREO" ? "Correo" : "Supervisión"} · semana del ${fecha(a.fecha_inicio)}`,
+    `<div class="rejilla">
+      <div class="campo"><label>Periodo</label><div>${fecha(a.fecha_inicio)} — ${fecha(a.fecha_fin)}</div></div>
+      <div class="campo"><label>Analista asignado</label>
+        <div>${
+          a.analista
+            ? `<span class="insignia acento">${esc(a.analista)}</span>`
+            : "—"
+        }</div></div>
+      <div class="campo"><label>Programada por</label><div>${esc(a.programada_por || "—")}</div></div>
+      <div class="campo"><label>Estado</label><div><span class="insignia ${
+        cerrada ? "ok" : "alerta"
+      }">${cerrada ? "Cerrada" : "En proceso"}</span></div></div>
+      <div class="campo"><label>Avance</label>
+        <div>${a.revisados} de ${a.total}<div class="avance"><div style="width:${a.avance}%"></div></div></div></div>
+    </div>
+
+    <div class="tarjetas" style="margin:16px 0">
+      <div class="tarjeta cyan"><div class="etiqueta">Conformes</div><div class="valor">${a.conteo.CONFORME}</div></div>
+      <div class="tarjeta rojo"><div class="etiqueta">Incidencias</div><div class="valor">${a.conteo.INCIDENCIA}</div></div>
+      <div class="tarjeta amarillo"><div class="etiqueta">Sin revisar</div><div class="valor">${a.conteo.PENDIENTE}</div></div>
+      <div class="tarjeta"><div class="etiqueta">No aplican</div><div class="valor">${a.conteo.NO_APLICA}</div></div>
+    </div>
+
+    <div class="tabla-wrap" style="margin-bottom:16px">${html}</div>
+
+    <div class="campo"><label>Observaciones generales de la semana</label>
+      <textarea id="aud-obs" rows="3" ${cerrada ? "disabled" : ""}>${esc(a.observaciones || "")}</textarea></div>
+    ${
+      cerrada
+        ? `<div class="aviso info">Cerrada por ${esc(a.cerrada_por || "—")} el ${fechaHora(a.fecha_cierre)}</div>`
+        : ""
+    }`,
+    puedeEditar()
+      ? `${esAdmin() ? '<button class="btn-peligro" id="aud-borrar">Eliminar</button>' : ""}
+         ${
+           esAdmin() && !cerrada
+             ? '<button class="btn-secundario" id="aud-reasignar">Reasignar</button>'
+             : ""
+         }
+         ${
+           editable
+             ? `<button class="btn-secundario" id="aud-agregar">Agregar punto</button>
+                <button class="btn-secundario" id="aud-guardar">Guardar observaciones</button>
+                <button class="btn-primario" id="aud-cerrar">Cerrar auditoría</button>`
+             : `<button class="btn-secundario" id="aud-reabrir">Reabrir</button>`
+         }`
+      : "",
+    true
+  );
+
+  if (!puedeEditar()) return;
+
+  document.querySelectorAll("[data-item]").forEach((b) => {
+    b.onclick = async () => {
+      const nuevoEstado = b.dataset.estado;
+      const item = a.items.find((i) => String(i.id) === b.dataset.item);
+      let observacion = item.observacion;
+
+      if (nuevoEstado === "INCIDENCIA") {
+        observacion = await pedirTexto(
+          "Describe la incidencia",
+          "¿Qué se encontró? ¿Qué falta por hacer?",
+          item.observacion || ""
+        );
+        if (observacion === null) return;
+        if (!observacion.trim()) {
+          toast("Una incidencia necesita descripción", "error");
+          return;
+        }
+      }
+      try {
+        await api(`/api/auditorias/items/${item.id}`, {
+          method: "PUT",
+          body: JSON.stringify({ estado: nuevoEstado, observacion }),
+        });
+        verAuditoria(id);
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+  });
+
+  document.querySelectorAll("[data-evidencia]").forEach((b) => {
+    b.onclick = async () => {
+      const datos = await pedirEvidencia();
+      if (!datos) return;
+      try {
+        await api(`/api/auditorias/items/${b.dataset.evidencia}/evidencias`, {
+          method: "POST",
+          body: JSON.stringify(datos),
+        });
+        toast("Evidencia agregada");
+        verAuditoria(id);
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+  });
+
+  document.querySelectorAll("[data-quitar-evidencia]").forEach((b) => {
+    b.onclick = async () => {
+      if (!(await confirmar("¿Quitar esta evidencia?"))) return;
+      try {
+        await api(`/api/auditorias/evidencias/${b.dataset.quitarEvidencia}`, { method: "DELETE" });
+        verAuditoria(id);
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+  });
+
+  const guardarObs = async (estadoNuevo) => {
+    try {
+      await api(`/api/auditorias/${id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          estado: estadoNuevo,
+          analista_id: a.analista_id,
+          observaciones: $("#aud-obs") ? $("#aud-obs").value : a.observaciones,
+        }),
+      });
+      return true;
+    } catch (err) {
+      toast(err.message, "error");
+      return false;
+    }
+  };
+
+  const bGuardar = $("#aud-guardar");
+  if (bGuardar)
+    bGuardar.onclick = async () => {
+      if (await guardarObs("EN_PROCESO")) {
+        toast("Observaciones guardadas");
+        verAuditoria(id);
+      }
+    };
+
+  const bCerrar = $("#aud-cerrar");
+  if (bCerrar)
+    bCerrar.onclick = async () => {
+      if (await guardarObs("CERRADA")) {
+        toast("Auditoría cerrada");
+        await refrescarContadorAlertas();
+        verAuditoria(id);
+      }
+    };
+
+  const bReabrir = $("#aud-reabrir");
+  if (bReabrir)
+    bReabrir.onclick = async () => {
+      if (await guardarObs("EN_PROCESO")) {
+        toast("Auditoría reabierta");
+        verAuditoria(id);
+      }
+    };
+
+  const bAgregar = $("#aud-agregar");
+  if (bAgregar)
+    bAgregar.onclick = async () => {
+      const texto = await pedirTexto("Agregar punto al checklist", "Qué hay que revisar", "");
+      if (!texto || !texto.trim()) return;
+      try {
+        await api(`/api/auditorias/${id}/items`, {
+          method: "POST",
+          body: JSON.stringify({ categoria: "Agregado", descripcion: texto.trim() }),
+        });
+        verAuditoria(id);
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+
+  const bReasignar = $("#aud-reasignar");
+  if (bReasignar)
+    bReasignar.onclick = async () => {
+      const analistas = estado.catalogos.analistas || [];
+      const elegido = await pedirOpcion(
+        "Reasignar auditoría",
+        "Analista responsable",
+        analistas.map((u) => ({ id: u.id, nombre: `${u.nombre} (${u.rol})` })),
+        a.analista_id
+      );
+      if (!elegido) return;
+      try {
+        await api(`/api/auditorias/${id}`, {
+          method: "PUT",
+          body: JSON.stringify({
+            estado: a.estado,
+            analista_id: Number(elegido),
+            observaciones: a.observaciones,
+          }),
+        });
+        toast("Auditoría reasignada");
+        verAuditoria(id);
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+
+  const bBorrar = $("#aud-borrar");
+  if (bBorrar)
+    bBorrar.onclick = async () => {
+    if (await confirmar("¿Eliminar esta auditoría y todo su checklist?")) {
+      try {
+        await api(`/api/auditorias/${id}`, { method: "DELETE" });
+        cerrarModal();
+        toast("Auditoría eliminada");
+        verAuditorias();
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    }
+  };
+}
+
+/** Enlace y nombre de un archivo de Drive. Devuelve null si se cancela. */
+function pedirEvidencia() {
+  return new Promise((resolve) => {
+    $("#visor").innerHTML = `
+      <div class="fondo-modal">
+        <div class="modal">
+          <header><h3>Agregar evidencia</h3><button class="cerrar" type="button">&times;</button></header>
+          <div class="cuerpo">
+            <form id="form-evidencia">
+              <div class="campo"><label>Enlace de Google Drive *</label>
+                <input name="url" type="url" required
+                       placeholder="https://drive.google.com/file/d/…"></div>
+              <div class="campo"><label>Nombre del archivo</label>
+                <input name="nombre" maxlength="200"></div>
+            </form>
+          </div>
+          <footer>
+            <button class="btn-secundario" id="ev-cancelar">Cancelar</button>
+            <button class="btn-primario" id="ev-ok">Guardar</button>
+          </footer>
+        </div>
+      </div>`;
+    const cerrar = (resultado) => {
+      $("#visor").innerHTML = "";
+      resolve(resultado);
+    };
+    $("#visor .cerrar").onclick = () => cerrar(null);
+    $("#ev-cancelar").onclick = () => cerrar(null);
+    $("#ev-ok").onclick = () => {
+      const form = $("#form-evidencia");
+      if (!form.reportValidity()) return;
+      cerrar(recolectar(form));
+    };
+    $("#form-evidencia [name=url]").focus();
+  });
+}
+
+const REPORTES_POR_MES = 4;
+
+function modalReporteMensual(auditorias) {
+  const mesActual = hoyISO().slice(0, 7);
+  abrirModal(
+    "Reporte mensual de auditoría",
+    `<form id="form-mensual">
+      <div class="rejilla">
+        <div class="campo"><label>Auditoría</label>
+          <select name="tipo">${Object.entries(TIPOS_AUDITORIA)
+            .map(([k, v]) => `<option value="${k}" ${k === "NORTON" ? "selected" : ""}>${v}</option>`)
+            .join("")}</select></div>
+        <div class="campo"><label>Mes</label>
+          <input name="mes" type="month" value="${mesActual}"></div>
+      </div>
+    </form>
+    <div id="mensual-semanas"></div>
+    <div id="mensual-cuenta" style="margin-top:10px;color:var(--texto-tenue)"></div>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="descargar-mensual">Generar reporte</button>`
+  );
+
+  const form = $("#form-mensual");
+  const elegidas = () =>
+    [...document.querySelectorAll("[data-semana]:checked")].map((c) => Number(c.dataset.semana));
+  const contar = () => {
+    const n = elegidas().length;
+    $("#mensual-cuenta").textContent = `${n} de ${REPORTES_POR_MES} semanas seleccionadas`;
+    $("#descargar-mensual").disabled = n !== REPORTES_POR_MES;
+  };
+  const pintar = () => {
+    const { tipo, mes } = recolectar(form);
+    const lista = auditorias
+      .filter((a) => a.tipo === tipo && (!mes || a.fecha_inicio.slice(0, 7) <= mes))
+      .sort((x, y) => y.fecha_inicio.localeCompare(x.fecha_inicio));
+    // Se proponen las cuatro semanas más recientes del mes elegido
+    const propuestas = new Set(
+      lista
+        .filter((a) => mes && (a.fecha_inicio.startsWith(mes) || a.fecha_fin.startsWith(mes)))
+        .slice(0, REPORTES_POR_MES)
+        .map((a) => a.id)
+    );
+    $("#mensual-semanas").innerHTML = lista.length
+      ? `<div class="tabla-wrap" style="max-height:340px;overflow:auto"><table>
+          <thead><tr><th></th><th>Semana</th><th>Analista</th><th>Avance</th>
+          <th class="num">Incidencias</th><th>Estado</th></tr></thead>
+          <tbody>${lista
+            .map(
+              (a) => `<tr>
+              <td><input type="checkbox" data-semana="${a.id}" ${propuestas.has(a.id) ? "checked" : ""}></td>
+              <td>${fecha(a.fecha_inicio)} — ${fecha(a.fecha_fin)}</td>
+              <td>${esc(a.analista || "—")}</td>
+              <td>${a.revisados}/${a.total}</td>
+              <td class="num">${a.incidencias}</td>
+              <td><span class="insignia ${a.estado === "CERRADA" ? "ok" : "alerta"}">${
+                a.estado === "CERRADA" ? "Cerrada" : "En proceso"
+              }</span></td></tr>`
+            )
+            .join("")}</tbody></table></div>`
+      : `<div class="vacio">Sin auditorías registradas.</div>`;
+    document.querySelectorAll("[data-semana]").forEach((c) => (c.onchange = contar));
+    contar();
+  };
+  form.onchange = pintar;
+  pintar();
+
+  $("#cancelar").onclick = cerrarModal;
+  $("#descargar-mensual").onclick = () => {
+    const ids = elegidas();
+    if (ids.length !== REPORTES_POR_MES) return;
+    const params = new URLSearchParams();
+    ids.forEach((id) => params.append("ids", id));
+    location.href = `/api/auditorias/reporte-mensual?${params}`;
+    cerrarModal();
+  };
+}
+
+/** Pide elegir una opción en un modal. Devuelve null si se cancela. */
+function pedirOpcion(titulo, etiqueta, lista, seleccionado) {
+  return new Promise((resolve) => {
+    $("#visor").innerHTML = `
+      <div class="fondo-modal">
+        <div class="modal">
+          <header><h3>${esc(titulo)}</h3><button class="cerrar" type="button">&times;</button></header>
+          <div class="cuerpo">
+            <div class="campo"><label>${esc(etiqueta)}</label>
+              <select id="sel-pedido">${opciones(lista, seleccionado, "")}</select></div>
+          </div>
+          <footer>
+            <button class="btn-secundario" id="sel-cancelar">Cancelar</button>
+            <button class="btn-primario" id="sel-ok">Guardar</button>
+          </footer>
+        </div>
+      </div>`;
+    const cerrar = (r) => {
+      $("#visor").innerHTML = "";
+      resolve(r);
+    };
+    $("#visor .cerrar").onclick = () => cerrar(null);
+    $("#sel-cancelar").onclick = () => cerrar(null);
+    $("#sel-ok").onclick = () => cerrar($("#sel-pedido").value);
+  });
+}
+
+/** Pide un texto en un modal. Devuelve null si se cancela. */
+function pedirTexto(titulo, etiqueta, valor = "") {
+  return new Promise((resolve) => {
+    const previo = $("#modal").innerHTML;
+    $("#visor").innerHTML = `
+      <div class="fondo-modal">
+        <div class="modal">
+          <header><h3>${esc(titulo)}</h3><button class="cerrar" type="button">&times;</button></header>
+          <div class="cuerpo">
+            <div class="campo"><label>${esc(etiqueta)}</label>
+              <textarea id="txt-pedido" rows="4">${esc(valor)}</textarea></div>
+          </div>
+          <footer>
+            <button class="btn-secundario" id="txt-cancelar">Cancelar</button>
+            <button class="btn-primario" id="txt-ok">Guardar</button>
+          </footer>
+        </div>
+      </div>`;
+    const cerrar = (resultado) => {
+      $("#visor").innerHTML = "";
+      resolve(resultado);
+    };
+    $("#visor .cerrar").onclick = () => cerrar(null);
+    $("#txt-cancelar").onclick = () => cerrar(null);
+    $("#txt-ok").onclick = () => cerrar($("#txt-pedido").value);
+    $("#txt-pedido").focus();
+  });
+}
+
