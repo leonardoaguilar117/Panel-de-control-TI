@@ -3516,3 +3516,358 @@ async function verNotificaciones() {
   });
 }
 
+// ---------------------------------------------------------------- personal de TI
+
+const ROLES = { ADMIN: "Administrador", CAPTURA: "Captura", CONSULTA: "Consulta" };
+const INSIGNIA_ROL = { ADMIN: "acento", CAPTURA: "ok", CONSULTA: "neutra" };
+
+async function verUsuarios() {
+  const usuarios = await api("/api/usuarios");
+  const yo = estado.usuario.id;
+  const soyPrincipal = usuarios.some((u) => u.principal && u.id === yo);
+  const gestionable = (u) =>
+    u.id !== yo && !u.principal && (soyPrincipal || u.rol !== "ADMIN");
+  const activos = usuarios.filter((u) => u.activo);
+  const contar = (rol) => activos.filter((u) => u.rol === rol).length;
+
+  $("#vista").innerHTML = `
+    <div class="encabezado">
+      <div><h2>Personal de TI</h2><p>Cuentas con acceso al inventario</p></div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn-secundario" id="btn-mi-pass">Mi contraseña</button>
+        <button class="btn-primario" id="btn-nuevo-usr">Agregar integrante</button>
+      </div>
+    </div>
+    <div class="tarjetas">
+      <div class="tarjeta cyan"><div class="etiqueta">Cuentas activas</div><div class="valor">${activos.length}</div>
+        <div class="pie">${usuarios.length - activos.length} desactivadas</div></div>
+      <div class="tarjeta rosa"><div class="etiqueta">Administradores</div><div class="valor">${contar("ADMIN")}</div></div>
+      <div class="tarjeta"><div class="etiqueta">Captura</div><div class="valor">${contar("CAPTURA")}</div></div>
+      <div class="tarjeta"><div class="etiqueta">Consulta</div><div class="valor">${contar("CONSULTA")}</div></div>
+    </div>
+    <div class="tabla-wrap"><table>
+      <thead><tr><th>Usuario</th><th>Nombre</th><th>Rol</th><th>Estatus</th><th>Último acceso</th><th></th></tr></thead>
+      <tbody>${usuarios
+        .map(
+          (u) => `<tr>
+          <td class="codigo">${esc(u.username)}</td>
+          <td>${htmlAvatar(u, "chico")} ${esc(u.nombre)}
+            ${u.principal ? '<span class="insignia acento" style="margin-left:6px">Principal</span>' : ""}
+            ${u.id === yo ? '<span class="insignia neutra" style="margin-left:6px">Tú</span>' : ""}</td>
+          <td><span class="insignia ${INSIGNIA_ROL[u.rol]}">${ROLES[u.rol]}</span></td>
+          <td><span class="insignia ${u.activo ? "ok" : "peligro"}">${u.activo ? "Activo" : "Desactivado"}</span></td>
+          <td>${fechaHora(u.ultimo_acceso)}</td>
+          <td>${
+            gestionable(u)
+              ? `<button class="btn-secundario btn-mini" data-usr="${u.id}">Editar</button>`
+              : ""
+          }</td></tr>`
+        )
+        .join("")}</tbody></table></div>`;
+
+  $("#btn-mi-pass").onclick = () => modalPassword();
+  $("#btn-nuevo-usr").onclick = () => modalUsuario(null, soyPrincipal);
+  document.querySelectorAll("[data-usr]").forEach((b) => {
+    b.onclick = () =>
+      modalUsuario(usuarios.find((u) => String(u.id) === b.dataset.usr), soyPrincipal);
+  });
+}
+
+function modalUsuario(u, soyPrincipal) {
+  const roles = soyPrincipal ? ["ADMIN", "CAPTURA", "CONSULTA"] : ["CAPTURA", "CONSULTA"];
+  const rolActual = u?.rol || "CAPTURA";
+
+  abrirModal(
+    u ? `Editar ${u.username}` : "Agregar integrante de TI",
+    `<form id="form-usr">
+      <div class="rejilla">
+        ${
+          u
+            ? ""
+            : `<div class="campo"><label>Usuario *</label>
+                 <input name="username" required minlength="3" maxlength="40" autocomplete="off"
+                        placeholder="nombre.apellido"></div>`
+        }
+        <div class="campo"><label>Nombre completo *</label>
+          <input name="nombre" required value="${esc(u?.nombre || "")}"></div>
+        <div class="campo"><label>Rol *</label>
+          <select name="rol">${roles
+            .map((r) => `<option value="${r}" ${r === rolActual ? "selected" : ""}>${ROLES[r]}</option>`)
+            .join("")}</select></div>
+        <div class="campo"><label>${u ? "Nueva contraseña" : "Contraseña *"}</label>
+          <input name="password" type="password" minlength="8" autocomplete="new-password"
+                 ${u ? 'placeholder="Sin cambios"' : "required"}></div>
+        ${u ? `<div class="campo"><label>Estatus</label>${interruptor("activo", u.activo)}</div>` : ""}
+      </div>
+    </form>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Guardar</button>`
+  );
+
+  $("#cancelar").onclick = cerrarModal;
+  $("#guardar").onclick = async () => {
+    const form = $("#form-usr");
+    if (!form.reportValidity()) return;
+    const datos = recolectar(form);
+    try {
+      await api(u ? `/api/usuarios/${u.id}` : "/api/usuarios", {
+        method: u ? "PUT" : "POST",
+        body: JSON.stringify(datos),
+      });
+      cerrarModal();
+      toast(u ? "Cuenta actualizada" : "Integrante agregado");
+      verUsuarios();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
+// ---------------------------------------------------------------- reportes
+
+async function verReportes() {
+  $("#vista").innerHTML = `
+    <div class="encabezado">
+      <div><h2>Reportes</h2><p>Distribución del inventario y exportación a Excel</p></div>
+      <a class="boton btn-primario" href="/api/reportes/exportar"
+         style="text-decoration:none;display:inline-block">Descargar Excel</a>
+    </div>
+    <div class="filtros">
+      <div class="campo"><label>Agrupar por</label>
+        <select id="r-grupo">
+          <option value="sucursal">Sucursal</option>
+          <option value="departamento">Departamento</option>
+          <option value="tipo">Tipo de activo</option>
+          <option value="estatus">Estatus</option>
+        </select></div>
+    </div>
+    <div id="tabla-reporte"></div>`;
+
+  $("#r-grupo").onchange = cargarReporte;
+  cargarReporte();
+}
+
+async function cargarReporte() {
+  const filas = await api(`/api/reportes/inventario?agrupar_por=${$("#r-grupo").value}`);
+  const total = filas.reduce((s, f) => s + f.activos, 0);
+  const maximo = Math.max(1, ...filas.map((f) => f.activos));
+
+  $("#tabla-reporte").innerHTML = filas.length
+    ? `<div class="panel">
+        ${filas
+          .map(
+            (f, i) => `<div class="barra-fila">
+          <div class="nombre">${esc(f.grupo)}</div>
+          <div class="pista"><div class="relleno" style="width:${(f.activos / maximo) * 100}%;animation-delay:${i * 50}ms"></div></div>
+          <div class="cifra">${f.activos}</div></div>`
+          )
+          .join("")}
+        <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);
+                    display:flex;justify-content:space-between;font-weight:600">
+          <span>TOTAL</span><span>${total}</span></div>
+      </div>`
+    : `<div class="panel"><div class="vacio">Sin datos para reportar todavía.</div></div>`;
+}
+
+// ---------------------------------------------------------------- bitácora
+
+async function verBitacora() {
+  const registros = await api("/api/bitacora?limite=200");
+  $("#vista").innerHTML = `
+    <div class="encabezado">
+      <div><h2>Bitácora</h2><p>Quién hizo qué y cuándo</p></div>
+    </div>
+    ${
+      registros.length
+        ? `<div class="tabla-wrap"><table>
+            <thead><tr><th>Fecha</th><th>Usuario</th><th>Acción</th><th>Entidad</th><th>Detalle</th></tr></thead>
+            <tbody>${registros
+              .map(
+                (r) => `<tr><td>${fechaHora(r.fecha)}</td><td>${esc(r.usuario || "—")}</td>
+                <td><span class="insignia neutra">${esc(r.accion)}</span></td>
+                <td>${esc(r.entidad)}</td><td>${esc(r.detalle || "—")}</td></tr>`
+              )
+              .join("")}</tbody></table></div>`
+        : `<div class="panel"><div class="vacio">Sin movimientos registrados.</div></div>`
+    }`;
+}
+
+
+// ---------------------------------------------------------------- notas y pendientes
+
+const ESTADOS_NOTA = {
+  PENDIENTE: "Pendiente",
+  EN_PROCESO: "En proceso",
+  RESUELTA: "Resuelta",
+};
+
+async function verNotas() {
+  $("#vista").innerHTML = `
+    <div class="encabezado">
+      <div><h2>Notas y pendientes</h2><p>Recados del área, visibles para todo el equipo de TI</p></div>
+      ${puedeEditar() ? `<button class="btn-primario" id="btn-nueva-nota">Nueva nota</button>` : ""}
+    </div>
+    <div class="filtros">
+      <div class="campo"><label>Estado</label>
+        <select id="n-estado">
+          <option value="">Abiertas y resueltas</option>
+          <option value="PENDIENTE">Pendientes</option>
+          <option value="EN_PROCESO">En proceso</option>
+          <option value="RESUELTA">Resueltas</option>
+        </select></div>
+    </div>
+    <div id="lista-notas"></div>`;
+
+  if (puedeEditar()) $("#btn-nueva-nota").onclick = () => modalNota();
+  $("#n-estado").onchange = cargarNotas;
+  cargarNotas();
+}
+
+async function cargarNotas() {
+  const estado = $("#n-estado").value;
+  const notas = await api("/api/notas" + (estado ? `?estado=${estado}` : ""));
+
+  $("#lista-notas").innerHTML = notas.length
+    ? notas
+        .map(
+          (n) => `<div class="nota ${n.prioridad} ${n.estado === "RESUELTA" ? "resuelta" : ""}">
+        <div class="cabecera">
+          <b>${esc(n.titulo)}</b>
+          <span class="insignia ${
+            n.estado === "RESUELTA" ? "ok" : n.estado === "EN_PROCESO" ? "acento" : "alerta"
+          }">${ESTADOS_NOTA[n.estado]}</span>
+          <span class="insignia ${
+            n.prioridad === "ALTA" ? "peligro" : n.prioridad === "MEDIA" ? "alerta" : "neutra"
+          }">${n.prioridad}</span>
+          ${n.empleado ? `<span class="insignia neutra">${esc(n.empleado)}</span>` : ""}
+          ${n.activo ? `<span class="codigo">${esc(n.activo)}</span>` : ""}
+          ${
+            puedeEditar()
+              ? `<span style="margin-left:auto;display:flex;gap:6px">
+                   ${
+                     n.estado !== "RESUELTA"
+                       ? `<button class="btn-secundario btn-mini" data-resolver="${n.id}">Resolver</button>`
+                       : ""
+                   }
+                   <button class="btn-secundario btn-mini" data-editar-nota="${n.id}">Editar</button>
+                   <button class="btn-peligro btn-mini" data-borrar-nota="${n.id}">Eliminar</button>
+                 </span>`
+              : ""
+          }
+        </div>
+        ${n.contenido ? `<div class="cuerpo">${esc(n.contenido)}</div>` : ""}
+        <div class="meta">
+          ${esc(n.autor_nombre || "—")} · ${fechaHora(n.creado_en)}
+          ${n.resuelta_por ? ` · resuelta por ${esc(n.resuelta_por)} el ${fechaHora(n.resuelta_en)}` : ""}
+        </div>
+      </div>`
+        )
+        .join("")
+    : `<div class="panel"><div class="vacio">No hay notas. Úsalas para dejar pendientes que otros deban ver.</div></div>`;
+
+  if (!puedeEditar()) return;
+  document.querySelectorAll("[data-editar-nota]").forEach((b) => {
+    b.onclick = () => modalNota(notas.find((n) => String(n.id) === b.dataset.editarNota));
+  });
+  document.querySelectorAll("[data-resolver]").forEach((b) => {
+    b.onclick = async () => {
+      const n = notas.find((x) => String(x.id) === b.dataset.resolver);
+      try {
+        await api(`/api/notas/${n.id}`, {
+          method: "PUT",
+          body: JSON.stringify({
+            titulo: n.titulo,
+            contenido: n.contenido,
+            estado: "RESUELTA",
+            prioridad: n.prioridad,
+            empleado_id: n.empleado_id,
+            activo_id: n.activo_id,
+          }),
+        });
+        toast("Nota resuelta");
+        await refrescarContadorAlertas();
+        cargarNotas();
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+  });
+  document.querySelectorAll("[data-borrar-nota]").forEach((b) => {
+    b.onclick = async () => {
+      const n = notas.find((x) => String(x.id) === b.dataset.borrarNota);
+      if (await confirmar(`¿Eliminar la nota "${n.titulo}"?`)) {
+        try {
+          await api(`/api/notas/${n.id}`, { method: "DELETE" });
+          toast("Nota eliminada");
+          await refrescarContadorAlertas();
+          cargarNotas();
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      }
+    };
+  });
+}
+
+async function modalNota(n = null) {
+  const empleados = await api("/api/empleados");
+  abrirModal(
+    n ? "Editar nota" : "Nueva nota",
+    `<form id="form-nota">
+      <div class="campo"><label>Título *</label>
+        <input name="titulo" required maxlength="160" value="${esc(n?.titulo || "")}"
+               placeholder="Pendiente, recado o seguimiento"></div>
+      <div class="campo"><label>Detalle</label>
+        <textarea name="contenido" rows="4">${esc(n?.contenido || "")}</textarea></div>
+      <div class="rejilla">
+        <div class="campo"><label>Prioridad</label>
+          <select name="prioridad">
+            ${["ALTA", "MEDIA", "BAJA"]
+              .map(
+                (x) =>
+                  `<option value="${x}" ${x === (n?.prioridad || "MEDIA") ? "selected" : ""}>${x}</option>`
+              )
+              .join("")}
+          </select></div>
+        <div class="campo"><label>Estado</label>
+          <select name="estado">
+            ${Object.entries(ESTADOS_NOTA)
+              .map(
+                ([k, v]) =>
+                  `<option value="${k}" ${k === (n?.estado || "PENDIENTE") ? "selected" : ""}>${v}</option>`
+              )
+              .join("")}
+          </select></div>
+        <div class="campo"><label>Relacionada con</label>
+          <select name="empleado_id">${opciones(
+            empleados.map((e) => ({ id: e.id, nombre: `${e.nombre_completo} (${e.codigo})` })),
+            n?.empleado_id,
+            "— Ninguna persona —"
+          )}</select></div>
+      </div>
+    </form>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Guardar</button>`
+  );
+
+  $("#cancelar").onclick = cerrarModal;
+  $("#guardar").onclick = async () => {
+    const form = $("#form-nota");
+    if (!form.reportValidity()) return;
+    const datos = recolectar(form);
+    datos.activo_id = n?.activo_id || null;
+    try {
+      await api(n ? `/api/notas/${n.id}` : "/api/notas", {
+        method: n ? "PUT" : "POST",
+        body: JSON.stringify(datos),
+      });
+      cerrarModal();
+      toast(n ? "Nota actualizada" : "Nota creada");
+      await refrescarContadorAlertas();
+      cargarNotas();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
