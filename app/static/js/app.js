@@ -1094,3 +1094,521 @@ function irA(vista) {
   })[vista]();
 }
 
+// ---------------------------------------------------------------- tablero
+
+async function verTablero() {
+  const [t, alertas, bitacora] = await Promise.all([
+    api("/api/tablero"),
+    api("/api/alertas"),
+    api("/api/bitacora?limite=7"),
+  ]);
+  const criticas = alertas.filter((a) => a.severidad === "critica");
+  const porRecibir = t.responsivas_pendientes + t.responsivas_en_espera;
+  const renovaciones = t.vencimientos_licencias.filter((v) => v.dias !== null && v.dias <= 60).length;
+
+  const barras = (tipos) => {
+    const filas = tipos.map((tipo) => [tipo, t.por_tipo[tipo] || 0]).filter(([, n]) => n);
+    const tope = Math.max(1, ...filas.map(([, n]) => n));
+    return filas
+      .sort((a, b) => b[1] - a[1])
+      .map(
+        ([tipo, n], i) => `
+          <div class="barra-fila">
+            <div class="nombre">${esc(TIPOS[tipo] || tipo)}</div>
+            <div class="pista"><div class="relleno" style="width:${(n / tope) * 100}%;animation-delay:${i * 60}ms"></div></div>
+            <div class="cifra">${n}</div>
+          </div>`
+      )
+      .join("");
+  };
+  const barrasActivos = barras(TIPOS_FISICOS);
+  const barrasServicios = barras(Object.keys(TIPOS).filter((x) => !TIPOS_FISICOS.includes(x)));
+
+  const kpis = [
+    { valor: t.empleados_activos, etiqueta: "Empleados activos", pie: `${t.empleados_baja} dados de baja`,
+      icono: "empleados", color: "var(--graf-1)", ir: "empleados", enlace: "Ver empleados" },
+    { valor: t.total_activos, etiqueta: "Activos registrados",
+      pie: `${t.activos_asignados} asignados · ${t.activos_disponibles} libres`,
+      icono: "equipos", color: "var(--graf-3)", ir: "equipos", enlace: "Ver equipos" },
+    { valor: t.total_servicios, etiqueta: "Licencias y correos", pie: "Microsoft 365, Norton y Workspace",
+      icono: "licencias", color: "var(--graf-2)", ir: "licencias", enlace: "Ver licencias" },
+    { valor: porRecibir, etiqueta: "Responsivas por recibir",
+      pie: `${t.responsivas_pendientes} sin enviar · ${t.responsivas_en_espera} en firma`,
+      icono: "documento", color: "var(--alerta)", ir: "notificaciones", enlace: "Ver notificaciones" },
+    { valor: renovaciones, etiqueta: "Renovaciones en 60 días", pie: `${t.vencimientos_licencias.length} familias y cuentas`,
+      icono: "calendario", color: "var(--acento)", ir: "licencias", enlace: "Ver vencimientos" },
+    { valor: criticas.length, etiqueta: "Alertas críticas", pie: `${alertas.length} alertas en total`,
+      icono: "alertas", color: "var(--peligro)", ir: "alertas", enlace: "Ver alertas" },
+  ];
+
+  const accesos = [
+    { texto: "Nuevo empleado", icono: "empleados", c: "var(--graf-1)", accion: () => modalEmpleado() },
+    { texto: "Alta de equipo", icono: "equipos", c: "var(--graf-3)", accion: () => modalAltaEquipo() },
+    { texto: "Alta de tablet", icono: "tabletas", c: "var(--graf-1)", accion: () => modalAltaEquipo("TABLETA") },
+    { texto: "Nueva línea", icono: "telefonia", c: "var(--graf-2)",
+      accion: () => modalActivo(null, "TELEFONO", ["TELEFONO"]) },
+    { texto: "Asignar activo", icono: "asignar", c: "var(--primario)", accion: () => modalAsignar() },
+    { texto: "Nueva licencia", icono: "licencias", c: "var(--graf-1)",
+      accion: () => modalActivo(null, "LICENCIA_MICROSOFT", ["LICENCIA_MICROSOFT", "LICENCIA_NORTON"]) },
+    { texto: "Nuevo correo", icono: "correos", c: "var(--graf-3)",
+      accion: () => modalActivo(null, "CORREO_WORKSPACE", ["CORREO_WORKSPACE"]) },
+    { texto: "Nueva nota", icono: "notas", c: "var(--alerta)", accion: () => modalNota() },
+    { texto: "Exportar a Excel", icono: "descargar", c: "var(--graf-2)", siempre: true,
+      accion: () => (location.href = "/api/reportes/exportar") },
+  ].filter((a) => a.siempre || puedeEditar());
+
+  $("#vista").innerHTML = `
+    <div class="encabezado">
+      <div><h2>Tablero</h2><p>Resumen general de activos, servicios y pendientes</p></div>
+      ${
+        estado.usuario.password_por_defecto
+          ? `<div class="aviso warn" style="margin:0">La contraseña sigue siendo la de fábrica.
+             <button class="btn-secundario btn-mini" id="btn-pass">Cambiarla</button></div>`
+          : ""
+      }
+    </div>
+
+    <div class="kpis">
+      ${kpis
+        .map(
+          (k, i) => `<button class="tarjeta kpi" data-ir="${k.ir}" style="--kpi:${k.color};--i:${i}">
+            <div class="kpi-cuerpo">
+              <div class="valor">${k.valor}</div>
+              <div class="etiqueta">${esc(k.etiqueta)}</div>
+              <div class="pie">${esc(k.pie)}</div>
+            </div>
+            <span class="kpi-pie">${esc(k.enlace)}${icono("flecha")}</span>
+          </button>`
+        )
+        .join("")}
+    </div>
+
+    <div class="rejilla-tablero">
+      <div class="panel span-8" style="--i:0">
+        <h3>Accesos rápidos</h3>
+        <div class="accesos">
+          ${accesos
+            .map(
+              (a, i) => `<button class="acceso" data-acceso="${i}" style="--c:${a.c};--i:${i}">
+                <span class="ico">${icono(a.icono)}</span>${esc(a.texto)}</button>`
+            )
+            .join("")}
+        </div>
+      </div>
+
+      <div class="panel span-4" style="--i:1">
+        <div class="panel-cab">
+          <h3>Atención inmediata</h3>
+          <button class="btn-secundario btn-mini" data-ir="alertas">Ver alertas</button>
+        </div>
+        ${
+          criticas.length
+            ? criticas.slice(0, 5).map(itemAlerta).join("")
+            : `<div class="vacio">Sin alertas críticas.</div>`
+        }
+      </div>
+
+      <div class="panel span-6" style="--i:2">
+        <h3>Activos por departamento</h3>
+        <div id="graf-departamentos"></div>
+      </div>
+
+      <div class="panel span-6" style="--i:3">
+        <div class="panel-cab">
+          <h3>Vencimientos de licencias</h3>
+          <button class="btn-secundario btn-mini" data-ir="licencias">Ver licencias</button>
+        </div>
+        <div id="lista-vencimientos"></div>
+      </div>
+
+      <div class="panel span-8" style="--i:4">
+        <h3>Movimientos de activos</h3>
+        <div id="graf-movimientos"><div class="vacio">Cargando…</div></div>
+      </div>
+
+      <div class="panel span-4" style="--i:5">
+        <div class="panel-cab">
+          <h3>Actividad reciente</h3>
+          <button class="btn-secundario btn-mini" data-ir="bitacora">Bitácora</button>
+        </div>
+        <div class="actividad">${
+          bitacora.length
+            ? bitacora.map(filaActividad).join("")
+            : `<div class="vacio">Sin movimientos registrados.</div>`
+        }</div>
+      </div>
+
+      <div class="panel span-4" style="--i:6">
+        <h3>Activos por tipo</h3>
+        ${barrasActivos || `<div class="vacio">Aún no hay activos capturados.</div>`}
+      </div>
+
+      <div class="panel span-4" style="--i:7">
+        <h3>Licencias y correos</h3>
+        ${barrasServicios || `<div class="vacio">Aún no hay licencias ni correos.</div>`}
+      </div>
+
+      <div class="panel span-4" style="--i:8">
+        <h3>Quién concentra más activos</h3>
+        <div id="graf-ranking"><div class="vacio">Cargando…</div></div>
+      </div>
+    </div>`;
+
+  pintarIconos($("#vista"));
+  const btnPass = $("#btn-pass");
+  if (btnPass) btnPass.onclick = modalPassword;
+  document.querySelectorAll("#vista [data-ir]").forEach((b) => (b.onclick = () => irA(b.dataset.ir)));
+  activarAlertas($("#vista"), criticas);
+  document.querySelectorAll("#vista [data-acceso]").forEach((b) => {
+    b.onclick = () => accesos[Number(b.dataset.acceso)].accion();
+  });
+
+  dibujarDepartamentos(t.por_departamento);
+  dibujarVencimientos(t.vencimientos_licencias);
+  cargarGraficas();
+}
+
+const ACCIONES_BITACORA = {
+  CREAR: { verbo: "registró", icono: "mas", c: "var(--ok)" },
+  EDITAR: { verbo: "editó", icono: "editar", c: "var(--primario)" },
+  ELIMINAR: { verbo: "eliminó", icono: "eliminar", c: "var(--peligro)" },
+  ASIGNAR: { verbo: "asignó", icono: "asignar", c: "var(--acento)", frase: "asignó un activo" },
+  DEVOLVER: { verbo: "recibió", icono: "asignar", c: "var(--alerta)", frase: "recibió un activo de vuelta" },
+};
+
+const ENTIDADES = {
+  empleado: "empleado", activo: "activo", asignacion: "asignación", usuario: "usuario",
+  cuenta_licencia: "familia de licencias", nota: "nota", auditoria: "auditoría",
+  catalogo: "catálogo", sistema: "sistema", accesos: "accesos",
+  impresora: "impresora", correos: "correos", red: "red", verificacion: "número",
+};
+
+function hace(fechaTexto) {
+  const segundos = Math.max(0, (Date.now() - comoUTC(fechaTexto)) / 1000);
+  if (segundos < 60) return "ahora";
+  const minutos = Math.floor(segundos / 60);
+  if (minutos < 60) return `hace ${minutos} min`;
+  const horas = Math.floor(minutos / 60);
+  if (horas < 24) return `hace ${horas} h`;
+  const dias = Math.floor(horas / 24);
+  return dias < 30 ? `hace ${dias} d` : comoUTC(fechaTexto).toLocaleDateString("es-MX", { timeZone: ZONA_HORARIA });
+}
+
+function filaActividad(b, i) {
+  const info = ACCIONES_BITACORA[b.accion] || { verbo: b.accion.toLowerCase(), icono: "bitacora", c: "var(--texto-tenue)" };
+  return `<div class="actividad-fila" style="--c:${info.c};--i:${i}">
+    <span class="ico">${icono(info.icono)}</span>
+    <div style="min-width:0">
+      <div class="que"><b>${esc(b.usuario || "Sistema")}</b> ${esc(
+        info.frase || `${info.verbo} ${ENTIDADES[b.entidad] || b.entidad}`
+      )}</div>
+      <small>${esc(b.detalle || "")}</small>
+    </div>
+    <time>${hace(b.fecha)}</time>
+  </div>`;
+}
+
+// Los colores de gráfica salen del tema activo; cada tema los valida contra su superficie
+const colorTema = (variable) => getComputedStyle(document.documentElement).getPropertyValue(variable).trim();
+const serie1 = () => colorTema("--graf-1");
+const serie2 = () => colorTema("--graf-2");
+
+function arcoDona(cx, cy, R, r, a0, a1) {
+  const punto = (radio, a) => [cx + radio * Math.sin(a), cy - radio * Math.cos(a)];
+  const grande = a1 - a0 > Math.PI ? 1 : 0;
+  const [x0, y0] = punto(R, a0), [x1, y1] = punto(R, a1);
+  const [x2, y2] = punto(r, a1), [x3, y3] = punto(r, a0);
+  return `M${x0},${y0} A${R},${R} 0 ${grande} 1 ${x1},${y1} L${x2},${y2}
+          A${r},${r} 0 ${grande} 0 ${x3},${y3} Z`;
+}
+
+function dibujarDepartamentos(filas) {
+  const caja = $("#graf-departamentos");
+  if (!filas.length) {
+    caja.innerHTML = `<div class="vacio">Aún no hay activos asignados.</div>`;
+    return;
+  }
+  // Tres departamentos con color propio; el resto se agrupa en "Otros"
+  const principales = filas.length > 4 ? filas.slice(0, 3) : filas.slice(0, 4);
+  const resto = filas.slice(principales.length);
+  const rebanadas = principales.map((f, i) => ({
+    nombre: f.departamento,
+    valor: f.activos,
+    color: colorTema(`--graf-${i + 1}`),
+  }));
+  if (resto.length)
+    rebanadas.push({
+      nombre: `Otros (${resto.length})`,
+      valor: resto.reduce((s, f) => s + f.activos, 0),
+      color: colorTema("--graf-otros"),
+      detalle: resto.map((f) => `${esc(f.departamento)}: ${f.activos}`).join("<br>"),
+    });
+  const total = rebanadas.reduce((s, r) => s + r.valor, 0);
+
+  const C = 110, R = 100, r = 64;
+  let angulo = 0;
+  const trazos = rebanadas
+    .map((s, i) => {
+      const barrido = (s.valor / total) * Math.PI * 2;
+      const a0 = angulo;
+      angulo += barrido;
+      const d =
+        barrido >= Math.PI * 2 - 1e-6
+          ? arcoDona(C, C, R, r, 0, Math.PI) + arcoDona(C, C, R, r, Math.PI, Math.PI * 2)
+          : arcoDona(C, C, R, r, a0, angulo);
+      return `<path class="rebanada" data-i="${i}" d="${d}" fill="${s.color}"
+                style="animation-delay:${i * 70}ms"></path>`;
+    })
+    .join("");
+
+  const pct = (v) => `${Math.round((v / total) * 100)}%`;
+  caja.innerHTML = `
+    <div class="dona">
+      <svg viewBox="0 0 220 220" class="dona-svg" role="img"
+           aria-label="Activos asignados por departamento">
+        ${trazos}
+        <text x="${C}" y="${C - 4}" text-anchor="middle" class="dona-total">${total}</text>
+        <text x="${C}" y="${C + 18}" text-anchor="middle" class="dona-sub">asignados</text>
+      </svg>
+      <div class="dona-leyenda">
+        ${rebanadas
+          .map(
+            (s, i) => `<div class="dona-fila" data-i="${i}">
+              <i style="background:${s.color}"></i>
+              <span class="dona-nombre">${esc(s.nombre)}</span>
+              <span class="dona-valor">${s.valor}</span>
+              <span class="dona-pct">${pct(s.valor)}</span>
+            </div>`
+          )
+          .join("")}
+        ${
+          resto.length
+            ? `<div class="dona-desglose">${resto
+                .map((f) => `<div><span>${esc(f.departamento)}</span><span>${f.activos}</span></div>`)
+                .join("")}</div>`
+            : ""
+        }
+      </div>
+    </div>`;
+
+  const resaltar = (i) =>
+    caja.querySelectorAll("[data-i]").forEach((el) =>
+      el.classList.toggle("atenuada", i !== null && el.dataset.i !== String(i))
+    );
+  caja.querySelectorAll("[data-i]").forEach((el) => {
+    const s = rebanadas[Number(el.dataset.i)];
+    el.onmousemove = (e) => {
+      resaltar(el.dataset.i);
+      tooltipGrafica(
+        `<strong>${esc(s.nombre)}</strong>
+         <div><i style="background:${s.color}"></i>${s.valor} activo(s) · ${pct(s.valor)}</div>
+         ${s.detalle ? `<div style="display:block;margin-top:4px">${s.detalle}</div>` : ""}`,
+        e
+      );
+    };
+    el.onmouseleave = () => {
+      resaltar(null);
+      ocultarTooltip();
+    };
+  });
+}
+
+function dibujarVencimientos(lista) {
+  const caja = $("#lista-vencimientos");
+  if (!lista.length) {
+    caja.innerHTML = `<div class="vacio">No hay familias de licencias registradas.</div>`;
+    return;
+  }
+  const estadoDe = (v) => {
+    if (v.dias === null) return ["neutra", "Sin fecha"];
+    const dias = (n) => `${n} día${n === 1 ? "" : "s"}`;
+    if (v.dias < 0) return ["peligro", `Venció hace ${dias(-v.dias)}`];
+    if (v.dias === 0) return ["peligro", "Vence hoy"];
+    if (v.dias <= 30) return ["peligro", `Vence en ${dias(v.dias)}`];
+    if (v.dias <= 60) return ["alerta", `Vence en ${dias(v.dias)}`];
+    return ["ok", `Vence en ${dias(v.dias)}`];
+  };
+  caja.innerHTML = lista
+    .slice(0, 8)
+    .map((v) => {
+      const [tono, texto] = estadoDe(v);
+      return `<div class="vence-fila">
+        <span class="vence-producto ${v.producto === "NORTON" ? "norton" : "microsoft"}">${
+          v.producto === "NORTON" ? "Norton" : "Microsoft"
+        }</span>
+        <div class="vence-cuenta">
+          <b>${esc(v.nombre)}</b>
+          <small>${esc(v.correo || "")}${v.licencias ? ` · ${v.licencias} licencia(s)` : ""}</small>
+        </div>
+        <div class="vence-fecha">${v.fecha ? fecha(v.fecha) : "—"}</div>
+        <span class="insignia ${tono}">${texto}</span>
+      </div>`;
+    })
+    .join("");
+}
+
+async function cargarGraficas() {
+  const [mov, top] = await Promise.all([
+    api("/api/graficas/movimientos?meses=12"),
+    api("/api/graficas/top-empleados?limite=8"),
+  ]);
+  dibujarMovimientos(mov);
+  dibujarRanking(top);
+}
+
+// ---------------------------------------------------------------- gráficas
+
+
+function tooltipGrafica(html, evento) {
+  let tip = $("#tip-graf");
+  if (!tip) {
+    tip = document.createElement("div");
+    tip.id = "tip-graf";
+    tip.className = "tooltip-grafica";
+    document.body.append(tip);
+  }
+  tip.innerHTML = html;
+  tip.hidden = false;
+  const ancho = tip.offsetWidth;
+  const alto = tip.offsetHeight;
+  let x = evento.clientX + 14;
+  let y = evento.clientY - alto - 10;
+  if (x + ancho > window.innerWidth - 8) x = evento.clientX - ancho - 14;
+  if (y < 8) y = evento.clientY + 18;
+  tip.style.left = x + "px";
+  tip.style.top = y + "px";
+}
+
+function ocultarTooltip() {
+  const tip = $("#tip-graf");
+  if (tip) tip.hidden = true;
+}
+
+/** Barra vertical con el extremo del dato redondeado y la base a ras del eje. */
+function barraVertical(x, y, ancho, alto, radio = 4) {
+  if (alto <= 0) return "";
+  const r = Math.min(radio, ancho / 2, alto);
+  return `M${x},${y + alto} L${x},${y + r} Q${x},${y} ${x + r},${y}
+          L${x + ancho - r},${y} Q${x + ancho},${y} ${x + ancho},${y + r}
+          L${x + ancho},${y + alto} Z`;
+}
+
+function dibujarMovimientos(datos) {
+  const caja = $("#graf-movimientos");
+  const serie = datos.serie;
+  if (!serie.some((s) => s.asignaciones || s.devoluciones)) {
+    caja.innerHTML = `<div class="vacio">Todavía no hay movimientos registrados.</div>`;
+    return;
+  }
+
+  const W = 900, H = 260;
+  const M = { arriba: 16, derecha: 12, abajo: 34, izquierda: 42 };
+  const ancho = W - M.izquierda - M.derecha;
+  const alto = H - M.arriba - M.abajo;
+  const maximo = Math.max(1, ...serie.flatMap((s) => [s.asignaciones, s.devoluciones]));
+  // Escala redondeada hacia arriba para que la cuadrícula caiga en números limpios
+  const tope = Math.ceil(maximo / 4) * 4 || 4;
+  const paso = ancho / serie.length;
+  const anchoBarra = Math.max(5, Math.min(16, paso / 2 - 3));
+
+  const y = (v) => M.arriba + alto - (v / tope) * alto;
+
+  let marcas = "";
+  for (let i = 0; i <= 4; i++) {
+    const v = (tope / 4) * i;
+    const py = y(v);
+    marcas += `<line class="rejilla" x1="${M.izquierda}" y1="${py}" x2="${W - M.derecha}" y2="${py}"/>
+      <text x="${M.izquierda - 9}" y="${py + 4}" text-anchor="end">${v}</text>`;
+  }
+
+  let barras = "";
+  serie.forEach((s, i) => {
+    const centro = M.izquierda + paso * i + paso / 2;
+    // 2px de separación entre las dos barras del mismo mes
+    const x1 = centro - anchoBarra - 1;
+    const x2 = centro + 1;
+    const retardo = i * 35;
+    barras += `<g class="grupo-barras" data-i="${i}">
+      <path class="barra" style="animation-delay:${retardo}ms"
+            d="${barraVertical(x1, y(s.asignaciones), anchoBarra, alto - (y(s.asignaciones) - M.arriba))}" fill="${serie1()}"/>
+      <path class="barra" style="animation-delay:${retardo + 60}ms"
+            d="${barraVertical(x2, y(s.devoluciones), anchoBarra, alto - (y(s.devoluciones) - M.arriba))}" fill="${serie2()}"/>
+    </g>
+    <rect class="zona-hover" x="${M.izquierda + paso * i}" y="${M.arriba}" width="${paso}" height="${alto}" data-i="${i}"/>
+    <text x="${centro}" y="${H - 12}" text-anchor="middle">${esc(s.etiqueta)}</text>`;
+  });
+
+  caja.innerHTML = `
+    <div class="leyenda">
+      <span><i style="background:${serie1()}"></i> Asignaciones</span>
+      <span><i style="background:${serie2()}"></i> Devoluciones</span>
+    </div>
+    <svg class="grafica" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet"
+         role="img" aria-label="Asignaciones y devoluciones por mes">
+      ${marcas}
+      <line class="eje" x1="${M.izquierda}" y1="${M.arriba + alto}" x2="${W - M.derecha}" y2="${M.arriba + alto}"/>
+      ${barras}
+    </svg>
+    <div style="display:flex;gap:22px;flex-wrap:wrap;margin-top:12px;font-size:14.5px;color:var(--texto-tenue)">
+      <span><b style="color:var(--texto)">${datos.total_asignaciones}</b> asignaciones en el periodo</span>
+      <span><b style="color:var(--texto)">${datos.total_devoluciones}</b> devoluciones</span>
+      <span><b style="color:var(--texto)">${datos.activos_reasignados}</b> activos han cambiado de responsable</span>
+    </div>`;
+
+  caja.querySelectorAll(".zona-hover").forEach((zona) => {
+    const s = serie[Number(zona.dataset.i)];
+    zona.onmousemove = (e) =>
+      tooltipGrafica(
+        `<strong>${esc(s.etiqueta)}</strong>
+         <div><i style="background:${serie1()}"></i> ${s.asignaciones} asignaciones</div>
+         <div><i style="background:${serie2()}"></i> ${s.devoluciones} devoluciones</div>`,
+        e
+      );
+    zona.onmouseleave = ocultarTooltip;
+  });
+}
+
+function dibujarRanking(filas) {
+  const caja = $("#graf-ranking");
+  if (!filas.length) {
+    caja.innerHTML = `<div class="vacio">Aún no hay activos asignados.</div>`;
+    return;
+  }
+  const maximo = Math.max(...filas.map((f) => f.total));
+
+  caja.innerHTML = filas
+    .map((f, i) => {
+      const detalle = Object.entries(f.por_tipo)
+        .map(([tipo, n]) => `${TIPOS[tipo] || tipo}: ${n}`)
+        .join(" · ");
+      return `<div class="fila-ranking" data-i="${i}">
+        <div class="puesto">${i + 1}</div>
+        <div class="persona">
+          <b>${esc(f.nombre)}</b>
+          <small>${esc([f.departamento, f.sucursal].filter(Boolean).join(" · ") || f.codigo)}</small>
+          <div class="pista" style="margin-top:6px">
+            <div class="relleno" style="width:${(f.total / maximo) * 100}%;background:${serie1()};animation-delay:${i * 60}ms"></div>
+          </div>
+        </div>
+        <div style="text-align:right">
+          <b style="font-size:19.5px;font-variant-numeric:tabular-nums">${f.total}</b>
+          <div style="font-size:13px;color:var(--texto-tenue)">activos</div>
+        </div>
+      </div>`;
+    })
+    .join("");
+
+  caja.querySelectorAll(".fila-ranking").forEach((fila) => {
+    const f = filas[Number(fila.dataset.i)];
+    fila.onmousemove = (e) =>
+      tooltipGrafica(
+        `<strong>${esc(f.nombre)}</strong>` +
+          Object.entries(f.por_tipo)
+            .map(([tipo, n]) => `<div><i style="background:${serie1()}"></i> ${esc(TIPOS[tipo] || tipo)}: ${n}</div>`)
+            .join(""),
+        e
+      );
+    fila.onmouseleave = ocultarTooltip;
+  });
+}
+
