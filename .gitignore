@@ -1,0 +1,15 @@
+.env
+data/llave.key
+SSID*.docx
+User_Download_*.xlsx
+graphify-out/converted/
+
+# Datos de producción y respaldos: nunca al repositorio
+data/*
+!data/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+*.key
+__pycache__/
+*.pyc
