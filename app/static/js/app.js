@@ -2931,3 +2931,588 @@ function modalDevolver(asignacionId) {
   };
 }
 
+// ---------------------------------------------------------------- cuentas de licencia
+
+function modalCuentasLicencia() {
+  const cuentas = estado.catalogos.cuentas_licencia;
+  abrirModal(
+    "Familias de licencias",
+    `${
+      cuentas.length
+        ? `<div class="tabla-wrap" style="margin-bottom:14px"><table>
+            <thead><tr><th>Nombre</th><th>Producto</th><th class="num">Uso</th><th>Renovación</th><th></th></tr></thead>
+            <tbody>${cuentas
+              .map(
+                (c) => `<tr>
+                <td>${esc(c.nombre)}</td>
+                <td>${esc(c.producto)}</td>
+                <td class="num"><span class="insignia ${
+                  c.ranuras_usadas > c.ranuras_totales ? "peligro" : "ok"
+                }">${c.ranuras_usadas}/${c.ranuras_totales}</span></td>
+                <td>${fecha(c.fecha_renovacion)}</td>
+                <td style="display:flex;gap:6px">
+                  <button class="btn-secundario btn-mini" data-editar-cuenta="${c.id}">Editar</button>
+                  <button class="btn-peligro btn-mini" data-borrar-cuenta="${c.id}">Eliminar</button>
+                </td></tr>`
+              )
+              .join("")}</tbody></table></div>`
+        : `<div class="vacio">Aún no hay cuentas registradas.</div>`
+    }`,
+    `<button class="btn-secundario" id="cerrar-c">Cerrar</button>
+     <button class="btn-primario" id="nueva-cuenta">Nueva cuenta</button>`,
+    true
+  );
+
+  $("#cerrar-c").onclick = () => {
+    cerrarModal();
+    irA(estado.vista);
+  };
+  $("#nueva-cuenta").onclick = () => modalCuenta();
+  document.querySelectorAll("[data-editar-cuenta]").forEach((b) => {
+    b.onclick = () =>
+      modalCuenta(cuentas.find((c) => String(c.id) === b.dataset.editarCuenta));
+  });
+  document.querySelectorAll("[data-borrar-cuenta]").forEach((b) => {
+    b.onclick = async () => {
+      const c = cuentas.find((x) => String(x.id) === b.dataset.borrarCuenta);
+      if (await confirmar(`¿Eliminar la cuenta "${c.nombre}"?`)) {
+        try {
+          await api(`/api/cuentas-licencia/${c.id}`, { method: "DELETE" });
+          toast("Cuenta eliminada");
+          await recargarCatalogos();
+          modalCuentasLicencia();
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      }
+    };
+  });
+}
+
+function modalCuenta(c = null, alTerminar = modalCuentasLicencia, productoInicial = "") {
+  abrirModal(
+    c ? `Editar ${c.nombre}` : "Nueva familia de licencias",
+    `<form id="form-cuenta">
+      <div class="rejilla">
+        <div class="campo"><label>Nombre *</label><input name="nombre" required value="${esc(c?.nombre || "")}"></div>
+        <div class="campo"><label>Producto *</label>
+          <input name="producto" required list="productos" value="${esc(c?.producto || productoInicial)}" placeholder="Microsoft 365">
+          <datalist id="productos"><option>Microsoft 365</option><option>Norton 360</option></datalist></div>
+        <div class="campo"><label>Correo de la cuenta</label><input name="correo_cuenta" value="${esc(c?.correo_cuenta || "")}"></div>
+        <div class="campo"><label>Ranuras contratadas *</label>
+          <input name="ranuras_totales" id="ranuras-familia" type="number" min="1" required
+                 value="${c?.ranuras_totales ?? (/norton/i.test(productoInicial) ? 10 : 6)}"></div>
+        <div class="campo"><label>Fecha de renovación</label>
+          <input name="fecha_renovacion" type="date" value="${c?.fecha_renovacion || ""}"></div>
+      </div>
+      <div class="campo"><label>Dónde está la contraseña</label>
+        <input name="referencia_credencial" value="${esc(c?.referencia_credencial || "")}"
+               placeholder="Bitwarden &gt; Norton TI"></div>
+      <div class="campo"><label>Notas</label><textarea name="notas" rows="2">${esc(c?.notas || "")}</textarea></div>
+    </form>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Guardar</button>`
+  );
+
+  const producto = $('#form-cuenta [name="producto"]');
+  const ranuras = $("#ranuras-familia");
+  const ajustarTope = () => {
+    const tope = /norton/i.test(producto.value)
+      ? LICENCIAS_POR_FAMILIA.LICENCIA_NORTON
+      : /microsoft|365|office/i.test(producto.value)
+      ? LICENCIAS_POR_FAMILIA.LICENCIA_MICROSOFT
+      : null;
+    if (tope) {
+      ranuras.max = tope;
+      if (Number(ranuras.value) > tope) ranuras.value = tope;
+    } else ranuras.removeAttribute("max");
+  };
+  producto.oninput = ajustarTope;
+  ajustarTope();
+
+  $("#cancelar").onclick = () => alTerminar();
+  $("#guardar").onclick = async () => {
+    const form = $("#form-cuenta");
+    if (!form.reportValidity()) return;
+    try {
+      await api(c ? `/api/cuentas-licencia/${c.id}` : "/api/cuentas-licencia", {
+        method: c ? "PUT" : "POST",
+        body: JSON.stringify(recolectar(form)),
+      });
+      toast(c ? "Familia actualizada" : "Familia creada");
+      await recargarCatalogos();
+      alTerminar();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
+// ---------------------------------------------------------------- impresoras
+
+const PROPIETARIOS_IMPRESORA = [
+  { id: "PROVEEDOR", nombre: "Proveedor" },
+  { id: "PROPIA", nombre: "Propia" },
+];
+
+async function verImpresoras() {
+  $("#vista").innerHTML = `
+    <div class="encabezado">
+      <div><h2>Impresoras</h2><p>Inventario de impresoras</p></div>
+      ${puedeEditar() ? `<button class="btn-primario" id="btn-nueva-imp">Nueva impresora</button>` : ""}
+    </div>
+    <div class="filtros">
+      <div class="campo busqueda"><label>Buscar</label>
+        <input id="i-q" placeholder="Serie, locación o identificador del proveedor…"></div>
+      <div class="campo"><label>Propietario</label>
+        <select id="i-prop">${opciones(PROPIETARIOS_IMPRESORA, "", "Todos")}</select></div>
+      ${filtrosUbicacion("i")}
+    </div>
+    <div id="tabla-impresoras"></div>`;
+
+  if (puedeEditar()) $("#btn-nueva-imp").onclick = () => modalImpresora();
+  ["i-q", "i-prop"].forEach((id) => {
+    $("#" + id).oninput = cargarImpresoras;
+    $("#" + id).onchange = cargarImpresoras;
+  });
+  enlazarUbicacion("i", cargarImpresoras);
+  cargarImpresoras();
+}
+
+async function cargarImpresoras() {
+  const params = new URLSearchParams();
+  const q = $("#i-q").value.trim();
+  if (q) params.set("q", q);
+  if ($("#i-prop").value) params.set("propietario", $("#i-prop").value);
+  Object.entries(valoresUbicacion("i")).forEach(([k, v]) => params.set(k, v));
+
+  const lista = await api("/api/impresoras?" + params);
+  const mono = (t) => `<span style="font-family:var(--mono);font-size:14px">${esc(t || "—")}</span>`;
+  $("#tabla-impresoras").innerHTML = lista.length
+    ? `<div class="tabla-wrap"><table>
+        <thead><tr><th>Número de serie</th><th>Propietario</th><th>Locación</th>
+          <th>Sucursal / locación</th><th>Departamentos</th>
+          <th>Serie proveedor</th><th>Identificador del proveedor</th></tr></thead>
+        <tbody>${lista
+          .map(
+            (i) => `<tr class="clicable" data-id="${i.id}">
+              <td>${mono(i.numero_serie)}</td>
+              <td><span class="insignia ${i.propietario === "PROVEEDOR" ? "acento" : "ok"}">${
+                i.propietario === "PROVEEDOR" ? "Proveedor" : "Propia"
+              }</span></td>
+              <td>${esc(i.locacion || "—")}</td>
+              <td>${esc([i.sucursal, i.bodega].filter(Boolean).join(" · ") || "—")}</td>
+              <td>${i.departamentos.length ? i.departamentos.map((d) => esc(d.nombre)).join(", ") : "—"}</td>
+              <td>${mono(i.numero_serie_proveedor)}</td>
+              <td>${mono(i.identificador_proveedor)}</td>
+            </tr>`
+          )
+          .join("")}</tbody></table></div>`
+    : `<div class="panel"><div class="vacio">No hay impresoras que coincidan.</div></div>`;
+
+  if (!puedeEditar()) return;
+  document.querySelectorAll("#tabla-impresoras tr.clicable").forEach((tr) => {
+    tr.onclick = () => modalImpresora(lista.find((i) => String(i.id) === tr.dataset.id));
+  });
+}
+
+function modalImpresora(imp = null) {
+  const elegidos = new Set((imp?.departamento_ids || []).map(String));
+  abrirModal(
+    imp ? `Editar impresora ${imp.numero_serie}` : "Nueva impresora",
+    `<form id="form-imp">
+      <div class="rejilla">
+        <div class="campo"><label>Número de serie *</label>
+          <input name="numero_serie" required value="${esc(imp?.numero_serie || "")}"></div>
+        <div class="campo"><label>Proveedor / propietario *</label>
+          <select name="propietario" required>${opciones(PROPIETARIOS_IMPRESORA, imp?.propietario, "— Selecciona —")}</select></div>
+        <div class="campo"><label>Locación</label>
+          <input name="locacion" value="${esc(imp?.locacion || "")}"></div>
+        <div class="campo"><label>Sucursal</label>
+          <select name="sucursal_id">${opciones(estado.catalogos.sucursales, imp?.sucursal_id)}</select></div>
+        <div class="campo"><label>Locación</label>
+          <select name="bodega_id">${opciones(estado.catalogos.bodegas, imp?.bodega_id)}</select></div>
+        <div class="campo"><label>Número de serie del proveedor</label>
+          <input name="numero_serie_proveedor" value="${esc(imp?.numero_serie_proveedor || "")}"></div>
+        <div class="campo"><label>Identificador del proveedor *</label>
+          <input name="identificador_proveedor" required value="${esc(imp?.identificador_proveedor || "")}"></div>
+      </div>
+      <div class="campo"><label>Departamentos que la usan</label>
+        <div class="casillas">${estado.catalogos.departamentos
+          .map(
+            (d) => `<label class="casilla"><input type="checkbox" data-depto="${d.id}" ${
+              elegidos.has(String(d.id)) ? "checked" : ""
+            }><span>${esc(d.nombre)}</span></label>`
+          )
+          .join("")}</div></div>
+    </form>`,
+    `${imp ? '<button class="btn-peligro" id="borrar-imp">Eliminar</button>' : ""}
+     <button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Guardar</button>`
+  );
+
+  $("#cancelar").onclick = cerrarModal;
+  $("#guardar").onclick = async () => {
+    const form = $("#form-imp");
+    if (!form.reportValidity()) return;
+    const datos = {};
+    new FormData(form).forEach((v, k) => (datos[k] = v.trim() || null));
+    ["sucursal_id", "bodega_id"].forEach((k) => datos[k] && (datos[k] = Number(datos[k])));
+    datos.departamento_ids = [...form.querySelectorAll("[data-depto]:checked")].map((c) =>
+      Number(c.dataset.depto)
+    );
+    try {
+      await api(imp ? `/api/impresoras/${imp.id}` : "/api/impresoras", {
+        method: imp ? "PUT" : "POST",
+        body: JSON.stringify(datos),
+      });
+      cerrarModal();
+      toast(imp ? "Impresora actualizada" : "Impresora registrada");
+      cargarImpresoras();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+  if (imp)
+    $("#borrar-imp").onclick = async () => {
+      if (!(await confirmar(`¿Eliminar la impresora ${imp.numero_serie}?`))) return;
+      try {
+        await api(`/api/impresoras/${imp.id}`, { method: "DELETE" });
+        toast("Impresora eliminada");
+        cargarImpresoras();
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+}
+
+// ---------------------------------------------------------------- contraseñas
+
+const ALCANCES_RED = {
+  LOCAL: { titulo: "SSID Locales", vacio: "No hay redes locales registradas." },
+  FORANEA: { titulo: "SSID Foráneas", vacio: "No hay redes foráneas registradas." },
+};
+const PROVEEDORES_RED = [
+  { id: "TELMEX", nombre: "Telmex" },
+  { id: "TOTALPLAY", nombre: "Totalplay" },
+  { id: "MEGACABLE", nombre: "Megacable" },
+  { id: "OTRO", nombre: "Otro" },
+];
+const INSIGNIA_PROVEEDOR = { TELMEX: "acento", TOTALPLAY: "ok", MEGACABLE: "alerta", OTRO: "neutra" };
+
+async function copiarTexto(texto) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(texto);
+  const area = document.createElement("textarea");
+  area.value = texto;
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  document.execCommand("copy");
+  area.remove();
+}
+
+async function verContrasenas() {
+  const alcance = estado.alcanceRed || "LOCAL";
+  $("#vista").innerHTML = `
+    <div class="encabezado">
+      <div><h2>Contraseñas</h2><p>${ALCANCES_RED[alcance].titulo}</p></div>
+      ${esAdmin() ? `<button class="btn-primario" id="btn-nueva-red">Nueva red</button>` : ""}
+    </div>
+    <div class="pestanas" role="tablist">
+      ${Object.entries(ALCANCES_RED)
+        .map(
+          ([k, v]) => `<button role="tab" data-alcance="${k}" class="${k === alcance ? "activa" : ""}"
+                         aria-selected="${k === alcance}">${esc(v.titulo)}</button>`
+        )
+        .join("")}
+    </div>
+    <div class="filtros">
+      <div class="campo busqueda"><label>Buscar</label>
+        <input id="r-q" placeholder="Ubicación, SSID o número de cuenta…"></div>
+      <div class="campo"><label>Proveedor</label>
+        <select id="r-prov">${opciones(PROVEEDORES_RED, "", "Todos")}</select></div>
+    </div>
+    <div id="tabla-redes"></div>`;
+
+  document.querySelectorAll("[data-alcance]").forEach((b) => {
+    b.onclick = () => {
+      estado.alcanceRed = b.dataset.alcance;
+      verContrasenas();
+    };
+  });
+  if (esAdmin()) $("#btn-nueva-red").onclick = () => modalRed(null, alcance);
+
+  const lista = await api(`/api/redes?alcance=${alcance}`);
+  const pintar = () => {
+    const q = $("#r-q").value.trim().toLowerCase();
+    const prov = $("#r-prov").value;
+    pintarRedes(
+      lista.filter(
+        (r) =>
+          (!prov || r.proveedor === prov) &&
+          (!q || [r.ubicacion, r.ssid, r.numero_cuenta].some((t) => (t || "").toLowerCase().includes(q)))
+      ),
+      alcance
+    );
+  };
+  $("#r-q").oninput = pintar;
+  $("#r-prov").onchange = pintar;
+  pintar();
+}
+
+function pintarRedes(lista, alcance) {
+  const mono = (t) => `<span style="font-family:var(--mono);font-size:14px">${esc(t || "—")}</span>`;
+  $("#tabla-redes").innerHTML = lista.length
+    ? `<div class="tabla-wrap"><table>
+        <thead><tr><th>Ubicación de la red</th><th>SSID</th><th>Contraseña</th>
+          <th>Número de cuenta</th><th>Proveedor</th></tr></thead>
+        <tbody>${lista
+          .map(
+            (r) => `<tr class="${esAdmin() ? "clicable" : ""}" data-id="${r.id}">
+              <td>${esc(r.ubicacion)}</td>
+              <td>${mono(r.ssid)}</td>
+              <td><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                <span class="secreto" style="font-family:var(--mono);font-size:14px">${
+                  r.contrasena === null ? "—" : "••••••••"
+                }</span>
+                ${
+                  r.contrasena === null
+                    ? ""
+                    : `<button class="btn-secundario btn-mini" data-ver="${r.id}">Ver</button>
+                       <button class="btn-secundario btn-mini" data-copiar="${r.id}">Copiar</button>`
+                }</div></td>
+              <td>${mono(r.numero_cuenta)}</td>
+              <td><span class="insignia ${INSIGNIA_PROVEEDOR[r.proveedor] || "neutra"}">${esc(
+                PROVEEDORES_RED.find((p) => p.id === r.proveedor)?.nombre || r.proveedor
+              )}</span></td>
+            </tr>`
+          )
+          .join("")}</tbody></table></div>`
+    : `<div class="panel"><div class="vacio">${ALCANCES_RED[alcance].vacio}</div></div>`;
+
+  const red = (id) => lista.find((r) => String(r.id) === String(id));
+  document.querySelectorAll("#tabla-redes [data-ver]").forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      const celda = b.parentElement.querySelector(".secreto");
+      const oculta = b.textContent === "Ver";
+      celda.textContent = oculta ? red(b.dataset.ver).contrasena : "••••••••";
+      b.textContent = oculta ? "Ocultar" : "Ver";
+    };
+  });
+  document.querySelectorAll("#tabla-redes [data-copiar]").forEach((b) => {
+    b.onclick = async (e) => {
+      e.stopPropagation();
+      try {
+        await copiarTexto(red(b.dataset.copiar).contrasena);
+        toast("Contraseña copiada");
+      } catch {
+        toast("No se pudo copiar", "error");
+      }
+    };
+  });
+  if (!esAdmin()) return;
+  document.querySelectorAll("#tabla-redes tr.clicable").forEach((tr) => {
+    tr.onclick = () => modalRed(red(tr.dataset.id), alcance);
+  });
+}
+
+function modalRed(r, alcance) {
+  const alcances = Object.entries(ALCANCES_RED).map(([id, v]) => ({ id, nombre: v.titulo }));
+  abrirModal(
+    r ? `Editar red ${r.ssid}` : "Nueva red",
+    `<form id="form-red">
+      <div class="rejilla">
+        <div class="campo"><label>Tipo *</label>
+          <select name="alcance" required>${opciones(alcances, r?.alcance || alcance, "")}</select></div>
+        <div class="campo"><label>Ubicación de la red *</label>
+          <input name="ubicacion" required maxlength="160" value="${esc(r?.ubicacion || "")}"></div>
+        <div class="campo"><label>SSID *</label>
+          <input name="ssid" required maxlength="80" value="${esc(r?.ssid || "")}"></div>
+        <div class="campo"><label>Contraseña *</label>
+          <input name="contrasena" required maxlength="128" autocomplete="off" spellcheck="false"
+                 value="${esc(r?.contrasena || "")}"></div>
+        <div class="campo"><label>Número de cuenta</label>
+          <input name="numero_cuenta" maxlength="60" value="${esc(r?.numero_cuenta || "")}"></div>
+        <div class="campo"><label>Proveedor *</label>
+          <select name="proveedor" required>${opciones(PROVEEDORES_RED, r?.proveedor, "— Selecciona —")}</select></div>
+      </div>
+    </form>`,
+    `${r ? '<button class="btn-peligro" id="borrar-red">Eliminar</button>' : ""}
+     <button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Guardar</button>`
+  );
+
+  $("#cancelar").onclick = cerrarModal;
+  $("#guardar").onclick = async () => {
+    const form = $("#form-red");
+    if (!form.reportValidity()) return;
+    const datos = {};
+    new FormData(form).forEach((v, k) => (datos[k] = k === "contrasena" ? v : v.trim() || null));
+    try {
+      await api(r ? `/api/redes/${r.id}` : "/api/redes", {
+        method: r ? "PUT" : "POST",
+        body: JSON.stringify(datos),
+      });
+      cerrarModal();
+      toast(r ? "Red actualizada" : "Red registrada");
+      estado.alcanceRed = datos.alcance;
+      verContrasenas();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+  if (r)
+    $("#borrar-red").onclick = async () => {
+      if (!(await confirmar(`¿Eliminar la red ${r.ssid} de ${r.ubicacion}?`))) return;
+      try {
+        await api(`/api/redes/${r.id}`, { method: "DELETE" });
+        toast("Red eliminada");
+        verContrasenas();
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+}
+
+// ---------------------------------------------------------------- alertas
+
+function itemAlerta(a, i) {
+  return `<div class="alerta-item ${a.severidad} con-destino" data-alerta="${i}" role="button" tabindex="0">
+    <div><div class="titulo">${esc(a.titulo)}</div>
+    <div class="detalle">${esc(a.detalle || "")}</div></div></div>`;
+}
+
+async function abrirAlerta(a) {
+  cerrarFlotantes();
+  switch (a.tipo) {
+    case "licencia_por_vencer":
+    case "sobreasignacion":
+      if (!a.cuenta_id && a.activo_id) return verFichaActivo(a.activo_id);
+      estado.licencias = a.producto === "norton" ? "norton" : "microsoft";
+      return irA("licencias");
+    case "correo_sin_uso":
+      return verFichaActivo(a.activo_id);
+    case "baja_con_activos":
+      return verFichaEmpleado(a.empleado_id);
+    case "responsiva_atrasada":
+      if (puedeEditar()) {
+        const lista = await api("/api/notificaciones");
+        const asignacion = lista.find((n) => n.id === a.asignacion_id);
+        if (asignacion) return modalDocumentos(asignacion, false);
+      }
+      return verFichaActivo(a.activo_id);
+    case "responsiva":
+      return irA("notificaciones");
+    case "auditoria":
+      return verAuditoria(a.auditoria_id);
+    case "reemplazo":
+      return irA("equipos");
+  }
+}
+
+function activarAlertas(contenedor, alertas) {
+  contenedor.querySelectorAll("[data-alerta]").forEach((el) => {
+    const abrir = () => abrirAlerta(alertas[Number(el.dataset.alerta)]);
+    el.onclick = abrir;
+    el.onkeydown = (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        abrir();
+      }
+    };
+  });
+}
+
+async function verAlertas() {
+  const alertas = await api("/api/alertas?dias=60");
+  $("#vista").innerHTML = `
+    <div class="encabezado">
+      <div><h2>Alertas</h2><p>Vencimientos de los próximos 60 días, faltantes y riesgos detectados</p></div>
+    </div>
+    <div class="panel">
+      ${alertas.length ? alertas.map(itemAlerta).join("") : `<div class="vacio">Todo en orden. Sin alertas.</div>`}
+    </div>`;
+  activarAlertas($("#vista"), alertas);
+}
+
+// ---------------------------------------------------------------- notificaciones
+
+async function verNotificaciones() {
+  const lista = await api("/api/notificaciones");
+  const enEspera = lista.filter((n) => n.responsiva_estado === "ENVIADA");
+  const porEnviar = lista.filter((n) => n.responsiva_estado === "PENDIENTE");
+  const atrasadas = enEspera.filter((n) => n.atrasada).length;
+
+  const item = (n) => {
+    const info = ESTADOS_DOC[n.responsiva_estado];
+    const envio =
+      n.responsiva_estado === "ENVIADA"
+        ? ` · enviada${n.responsiva_destino ? " a " + n.responsiva_destino : ""}${
+            n.dias_en_espera != null ? ` hace ${n.dias_en_espera} días` : ""
+          }`
+        : "";
+    return `<div class="alerta-item notif con-destino ${
+      n.atrasada ? "critica" : n.responsiva_estado === "ENVIADA" ? "media" : "baja"
+    }" data-notif-activo="${n.activo_id}" role="button" tabindex="0">
+      <div style="flex:1;min-width:0">
+        <div class="titulo"><span class="codigo">${esc(n.activo_codigo)}</span>
+          · ${esc(TIPOS[n.activo_tipo] || n.activo_tipo)}${
+            n.activo_descripcion ? " · " + esc(n.activo_descripcion) : ""
+          }</div>
+        <div class="detalle">${esc(
+          `${n.empleado} (${n.codigo_empleado}) · entregado el ${fecha(n.fecha_asignacion)}${envio}`
+        )}</div>
+      </div>
+      <span class="insignia ${n.atrasada ? "peligro" : info.insignia}">${
+        n.atrasada ? "Atrasada" : esc(info.etiqueta)
+      }</span>
+      ${
+        puedeEditar()
+          ? `<button class="btn-secundario btn-mini" data-notif="${n.id}">Documentos</button>`
+          : ""
+      }
+    </div>`;
+  };
+
+  const bloque = (titulo, filas) =>
+    filas.length ? `<div class="panel"><h3>${titulo}</h3>${filas.map(item).join("")}</div>` : "";
+
+  $("#vista").innerHTML = `
+    <div class="encabezado">
+      <div><h2>Notificaciones</h2><p>Responsivas por recibir</p></div>
+    </div>
+    <div class="tarjetas">
+      <div class="tarjeta ${lista.length ? "rosa" : "cyan"}"><div class="etiqueta">Por recibir</div>
+        <div class="valor">${lista.length}</div></div>
+      <div class="tarjeta"><div class="etiqueta">En espera de firma</div>
+        <div class="valor">${enEspera.length}</div></div>
+      <div class="tarjeta amarillo"><div class="etiqueta">Sin enviar</div>
+        <div class="valor">${porEnviar.length}</div></div>
+      <div class="tarjeta ${atrasadas ? "rojo" : "cyan"}"><div class="etiqueta">Atrasadas</div>
+        <div class="valor">${atrasadas}</div></div>
+    </div>
+    ${
+      lista.length
+        ? bloque("En espera de firma", enEspera) + bloque("Sin enviar", porEnviar)
+        : `<div class="panel"><div class="vacio">Todas las responsivas están firmadas.</div></div>`
+    }`;
+
+  document.querySelectorAll("[data-notif]").forEach((b) => {
+    b.onclick = (ev) => {
+      ev.stopPropagation();
+      modalDocumentos(lista.find((n) => String(n.id) === b.dataset.notif), false);
+    };
+  });
+  document.querySelectorAll("[data-notif-activo]").forEach((el) => {
+    el.onclick = () => verFichaActivo(el.dataset.notifActivo);
+    el.onkeydown = (ev) => {
+      if (ev.target === el && (ev.key === "Enter" || ev.key === " ")) {
+        ev.preventDefault();
+        verFichaActivo(el.dataset.notifActivo);
+      }
+    };
+  });
+}
+
