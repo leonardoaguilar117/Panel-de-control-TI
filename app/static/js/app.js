@@ -1612,3 +1612,538 @@ function dibujarRanking(filas) {
   });
 }
 
+// ---------------------------------------------------------------- empleados
+
+async function verEmpleados() {
+  $("#vista").innerHTML = `
+    <div class="encabezado">
+      <div><h2>Empleados</h2><p>Personas y los activos que tienen asignados</p></div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn-secundario" id="btn-exportar">Exportar a Excel</button>
+        ${puedeEditar() ? `<button class="btn-primario" id="btn-nuevo">Nuevo empleado</button>` : ""}
+      </div>
+    </div>
+    <div class="filtros">
+      <div class="campo busqueda"><label>Buscar</label>
+        <input id="f-q" placeholder="Nombre, código o correo…"></div>
+      ${filtrosUbicacion("f")}
+      <div class="campo"><label>Estatus</label>
+        <select id="f-est"><option value="">Todos</option><option value="ACTIVO">Activo</option><option value="BAJA">Baja</option></select></div>
+    </div>
+    <div id="tabla-empleados"></div>`;
+
+  $("#btn-exportar").onclick = () => (location.href = "/api/empleados/exportar?" + filtrosEmpleados());
+  if (puedeEditar()) $("#btn-nuevo").onclick = () => modalEmpleado();
+  ["f-q", "f-est"].forEach((id) => {
+    const el = $("#" + id);
+    el.oninput = cargarEmpleados;
+    el.onchange = cargarEmpleados;
+  });
+  enlazarUbicacion("f", cargarEmpleados);
+  cargarEmpleados();
+}
+
+function filtrosEmpleados() {
+  const params = new URLSearchParams();
+  const q = $("#f-q").value.trim();
+  if (q) params.set("q", q);
+  Object.entries(valoresUbicacion("f")).forEach(([k, v]) => params.set(k, v));
+  if ($("#f-est").value) params.set("estatus", $("#f-est").value);
+  return params;
+}
+
+async function cargarEmpleados() {
+  const empleados = await api("/api/empleados?" + filtrosEmpleados());
+  $("#tabla-empleados").innerHTML = empleados.length
+    ? `<div class="tabla-wrap"><table>
+        <thead><tr><th>Código</th><th>Nombre</th><th>Departamento</th><th>Sucursal</th>
+        <th>Locación</th><th>Estatus</th><th class="num">Activos</th><th class="num">Licencias y correos</th></tr></thead>
+        <tbody>${empleados
+          .map(
+            (e) => `<tr class="clicable" data-id="${e.id}">
+            <td class="codigo">${esc(e.codigo)}</td>
+            <td>${esc(e.nombre_completo)}</td>
+            <td>${esc(e.departamento || "—")}</td>
+            <td>${esc(e.sucursal || "—")}</td>
+            <td>${esc(e.bodega || e.planta || "—")}</td>
+            <td><span class="insignia ${e.estatus === "ACTIVO" ? "ok" : "neutra"}">${e.estatus}</span></td>
+            <td class="num">${e.total_activos}</td>
+            <td class="num">${e.total_servicios}</td></tr>`
+          )
+          .join("")}</tbody></table></div>`
+    : `<div class="panel"><div class="vacio">No hay empleados que coincidan.</div></div>`;
+
+  document
+    .querySelectorAll("#tabla-empleados tr.clicable")
+    .forEach((tr) => (tr.onclick = () => verFichaEmpleado(tr.dataset.id)));
+}
+
+async function verFichaEmpleado(id) {
+  const e = await api(`/api/empleados/${id}`);
+
+  const bloqueActivo = (a) => `
+    <div class="panel" style="margin-bottom:12px;padding:14px 16px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
+        <span class="codigo">${esc(a.activo_codigo)}</span>
+        <span class="insignia neutra">${esc(TIPOS[a.activo_tipo] || a.activo_tipo)}</span>
+        <span>${esc(a.activo_descripcion || "")}</span>
+        <span style="color:var(--texto-tenue);font-size:14px">desde ${fecha(a.fecha_asignacion)}</span>
+        ${
+          puedeEditar()
+            ? `<span style="margin-left:auto;display:flex;gap:8px">
+                 ${
+                   LLEVAN_RESPONSIVA.includes(a.activo_tipo)
+                     ? `<button class="btn-secundario btn-mini" data-docs="${a.id}">Documentos</button>`
+                     : ""
+                 }
+                 <button class="btn-peligro btn-mini" data-devolver="${a.id}">Devolver</button>
+               </span>`
+            : ""
+        }
+      </div>
+      ${LLEVAN_RESPONSIVA.includes(a.activo_tipo) ? filaDocumento(a, "responsiva") : ""}
+      ${LLEVAN_INE.includes(a.activo_tipo) ? filaDocumento(a, "ine") : ""}
+    </div>`;
+  const fisicos = e.activos.filter((a) => TIPOS_FISICOS.includes(a.activo_tipo));
+  const servicios = e.activos.filter((a) => !TIPOS_FISICOS.includes(a.activo_tipo));
+
+  abrirModal(
+    e.nombre_completo,
+    `<div class="rejilla">
+      <div class="campo"><label>Código</label><div class="codigo">${esc(e.codigo)}</div></div>
+      <div class="campo"><label>Estatus</label><div><span class="insignia ${
+        e.estatus === "ACTIVO" ? "ok" : "neutra"
+      }">${esc(e.estatus)}</span></div></div>
+      <div class="campo"><label>Correo</label><div>${
+        e.correos?.length
+          ? e.correos.map((c) => `<div class="codigo" style="white-space:normal">${esc(c)}</div>`).join("")
+          : "—"
+      }</div></div>
+      <div class="campo"><label>Puesto</label><div>${esc(e.puesto || "—")}</div></div>
+      <div class="campo"><label>Departamento</label><div>${esc(e.departamento || "—")}</div></div>
+      <div class="campo"><label>Sucursal</label><div>${esc(e.sucursal || "—")}</div></div>
+      <div class="campo"><label>Locación</label><div>${esc(e.bodega || e.planta || "—")}</div></div>
+    </div>
+
+    <h3 style="font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--texto-tenue);margin:18px 0 10px">
+      Accesos a sistemas</h3>
+    <div class="tabla-wrap" style="margin-bottom:8px">
+      ${(e.accesos || [])
+        .map(
+          (s) => `<div class="doc-fila">
+            <strong style="min-width:220px">${esc(s.sistema)}</strong>
+            <span class="insignia ${s.entregado ? "ok" : "alerta"}">${
+              s.entregado ? "Entregado" : "Pendiente"
+            }</span>
+            ${
+              s.fecha_entrega
+                ? `<span style="color:var(--texto-tenue);font-size:14px">${fecha(s.fecha_entrega)}</span>`
+                : ""
+            }
+            <span class="nombre-doc ${s.usuario_sistema ? "" : "sin-doc"}">${
+              s.usuario_sistema ? esc(s.usuario_sistema) : "Sin usuario registrado"
+            }</span>
+          </div>`
+        )
+        .join("") || '<div class="vacio" style="padding:16px">No hay sistemas configurados.</div>'}
+    </div>
+    ${
+      puedeEditar()
+        ? `<button class="btn-secundario btn-mini" id="btn-accesos">Editar accesos</button>`
+        : ""
+    }
+
+    <h3 style="font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--texto-tenue);margin:18px 0 10px">
+      Activos asignados (${fisicos.length})</h3>
+    ${
+      fisicos.length
+        ? fisicos.map(bloqueActivo).join("")
+        : `<div class="vacio" style="padding:20px">Sin activos asignados.</div>`
+    }
+
+    <h3 style="font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--texto-tenue);margin:18px 0 10px">
+      Licencias y correos (${servicios.length})</h3>
+    ${
+      servicios.length
+        ? servicios.map(bloqueActivo).join("")
+        : `<div class="vacio" style="padding:20px">Sin licencias ni correos.</div>`
+    }
+
+    ${
+      e.historial.length
+        ? `<h3 style="font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--texto-tenue);margin:18px 0 8px">
+           Historial (${e.historial.length})</h3>
+           <div class="tabla-wrap"><table><thead><tr><th>Código</th><th>Tipo</th><th>Desde</th><th>Hasta</th><th>Motivo</th><th>Documentos</th></tr></thead>
+           <tbody>${e.historial
+             .map(
+               (h) => `<tr><td class="codigo">${esc(h.activo_codigo)}</td>
+               <td>${esc(TIPOS[h.activo_tipo] || h.activo_tipo)}</td>
+               <td>${fecha(h.fecha_asignacion)}</td><td>${fecha(h.fecha_devolucion)}</td>
+               <td>${esc(h.motivo_devolucion || "—")}</td>
+               <td>${celdaDocumentosHistorial(h)}</td></tr>`
+             )
+             .join("")}</tbody></table></div>`
+        : ""
+    }`,
+    puedeEditar()
+      ? `<button class="btn-peligro" id="btn-borrar-emp">Eliminar</button>
+         <button class="btn-primario" id="btn-asignar-a">Asignar activo</button>
+         <button class="btn-secundario" id="btn-editar-emp">Editar</button>`
+      : "",
+    true
+  );
+
+  activarBotonesDocumento([...e.activos, ...e.historial]);
+
+  if (puedeEditar()) {
+    $("#btn-editar-emp").onclick = () => modalEmpleado(e);
+    $("#btn-asignar-a").onclick = () => modalAsignar(null, e);
+    const bAcc = $("#btn-accesos");
+    if (bAcc) bAcc.onclick = () => modalAccesos(e);
+    document.querySelectorAll("[data-devolver]").forEach((b) => {
+      b.onclick = () => modalDevolver(b.dataset.devolver);
+    });
+    document.querySelectorAll("[data-docs]").forEach((b) => {
+      b.onclick = () => {
+        const asig = e.activos.find((a) => String(a.id) === b.dataset.docs);
+        modalDocumentos(asig);
+      };
+    });
+    $("#btn-borrar-emp").onclick = async () => {
+      if (
+        await confirmar(
+          `¿Eliminar a ${e.nombre_completo}? Esta acción no se puede deshacer.`
+        )
+      ) {
+        try {
+          await api(`/api/empleados/${e.id}`, { method: "DELETE" });
+          cerrarModal();
+          toast("Empleado eliminado");
+          verEmpleados();
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      }
+    };
+  }
+}
+
+async function modalAccesos(empleado) {
+  const accesos = await api(`/api/empleados/${empleado.id}/accesos`);
+  const hoy = hoyISO();
+
+  abrirModal(
+    `Accesos de ${empleado.nombre_completo}`,
+    `<form id="form-accesos">
+      ${accesos
+        .map(
+          (s, i) => `<div class="bloque" style="margin-bottom:12px">
+          <div class="contenido-bloque">
+            <div class="campo check" style="margin-bottom:12px">
+              <input type="checkbox" id="acc-${i}" data-acc="${i}" ${s.entregado ? "checked" : ""}>
+              <label for="acc-${i}"><b>${esc(s.sistema)}</b>${
+                s.descripcion ? ` — ${esc(s.descripcion)}` : ""
+              }</label>
+            </div>
+            <div class="rejilla" id="det-${i}" ${s.entregado ? "" : "hidden"}>
+              <div class="campo"><label>Usuario en el sistema</label>
+                <input name="usuario_${i}" value="${esc(s.usuario_sistema || "")}"></div>
+              <div class="campo"><label>Fecha de entrega</label>
+                <input name="fecha_${i}" type="date" value="${s.fecha_entrega || hoy}"></div>
+            </div>
+            <div class="campo" id="nota-${i}" ${s.entregado ? "" : "hidden"}>
+              <label>Notas</label>
+              <input name="notas_${i}" value="${esc(s.notas || "")}"></div>
+            ${
+              s.actualizado_por
+                ? `<div style="font-size:13px;color:var(--texto-tenue)">
+                     Última actualización: ${esc(s.actualizado_por)} · ${fechaHora(s.actualizado_en)}</div>`
+                : ""
+            }
+          </div>
+        </div>`
+        )
+        .join("")}
+      ${accesos.length ? "" : '<div class="vacio">No hay sistemas configurados. Agrégalos desde Catálogos.</div>'}
+    </form>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Guardar</button>`,
+    true
+  );
+
+  document.querySelectorAll("[data-acc]").forEach((ch) => {
+    ch.onchange = () => {
+      const i = ch.dataset.acc;
+      $(`#det-${i}`).hidden = !ch.checked;
+      $(`#nota-${i}`).hidden = !ch.checked;
+    };
+  });
+
+  $("#cancelar").onclick = cerrarModal;
+  $("#guardar").onclick = async () => {
+    const form = $("#form-accesos");
+    const datos = {
+      accesos: accesos.map((s, i) => ({
+        sistema_id: s.sistema_id,
+        entregado: $(`#acc-${i}`).checked,
+        usuario_sistema: form[`usuario_${i}`] ? form[`usuario_${i}`].value.trim() || null : null,
+        fecha_entrega: form[`fecha_${i}`] ? form[`fecha_${i}`].value || null : null,
+        notas: form[`notas_${i}`] ? form[`notas_${i}`].value.trim() || null : null,
+      })),
+    };
+    try {
+      await api(`/api/empleados/${empleado.id}/accesos`, {
+        method: "PUT",
+        body: JSON.stringify(datos),
+      });
+      cerrarModal();
+      toast("Accesos actualizados");
+      verFichaEmpleado(empleado.id);
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
+function modalEmpleado(e = null) {
+  const c = estado.catalogos;
+  abrirModal(
+    e ? "Editar empleado" : "Nuevo empleado",
+    `<form id="form-emp">
+      <div class="rejilla">
+        <div class="campo"><label>Nombre(s) *</label><input name="nombres" required value="${esc(e?.nombres || "")}"></div>
+        <div class="campo"><label>Apellidos *</label><input name="apellidos" required value="${esc(e?.apellidos || "")}"></div>
+        <div class="campo"><label>Puesto</label><input name="puesto" value="${esc(e?.puesto || "")}"></div>
+        <div class="campo"><label>Sucursal</label><select name="sucursal_id">${opciones(c.sucursales, e?.sucursal_id)}</select></div>
+        <div class="campo"><label>Departamento</label><select name="departamento_id">${opciones(c.departamentos, e?.departamento_id)}</select></div>
+        <div class="campo"><label>Locación</label><select name="bodega_id">${opciones(c.bodegas, e?.bodega_id)}</select></div>
+        <div class="campo"><label>Estatus</label><select name="estatus">
+          <option value="ACTIVO" ${e?.estatus !== "BAJA" ? "selected" : ""}>Activo</option>
+          <option value="BAJA" ${e?.estatus === "BAJA" ? "selected" : ""}>Baja</option></select></div>
+        <div class="campo"><label>Fecha de ingreso</label><input name="fecha_ingreso" type="date" value="${e?.fecha_ingreso || ""}"></div>
+        <div class="campo"><label>Fecha de baja</label><input name="fecha_baja" type="date" value="${e?.fecha_baja || ""}"></div>
+      </div>
+    </form>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Guardar</button>`
+  );
+
+  $("#cancelar").onclick = cerrarModal;
+  $("#guardar").onclick = async () => {
+    const form = $("#form-emp");
+    if (!form.reportValidity()) return;
+    const datos = recolectar(form);
+    try {
+      await api(e ? `/api/empleados/${e.id}` : "/api/empleados", {
+        method: e ? "PUT" : "POST",
+        body: JSON.stringify(datos),
+      });
+      cerrarModal();
+      toast(e ? "Empleado actualizado" : "Empleado creado");
+      verEmpleados();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
+// ---------------------------------------------------------------- licencias por familia
+
+const PRODUCTOS = {
+  microsoft: { titulo: "Microsoft 365", tipo: "LICENCIA_MICROSOFT", producto: "Microsoft 365" },
+  norton: { titulo: "Norton 360", tipo: "LICENCIA_NORTON", producto: "Norton 360" },
+};
+
+async function verLicencias() {
+  const clave = estado.licencias || "microsoft";
+  const p = PRODUCTOS[clave];
+  const grupos = await api(`/api/licencias/familias?producto=${clave}`);
+  const conCuenta = grupos.filter((g) => g.cuenta);
+  const total = grupos.reduce((s, g) => s + g.licencias.length, 0);
+  const asignadas = grupos.reduce((s, g) => s + g.licencias.filter((l) => l.empleado).length, 0);
+  const libres = conCuenta.reduce(
+    (s, g) => s + Math.max(0, g.cuenta.ranuras_totales - g.licencias.length), 0
+  );
+  const excedidas = conCuenta.filter((g) => g.licencias.length > g.cuenta.ranuras_totales).length;
+
+  $("#vista").innerHTML = `
+    <div class="encabezado">
+      <div><h2>Licencias</h2><p>${esc(p.titulo)} por familia</p></div>
+      ${
+        puedeEditar()
+          ? `<div style="display:flex;gap:10px;flex-wrap:wrap">
+               <button class="btn-secundario" id="btn-familias">Familias</button>
+               <button class="btn-secundario" id="btn-nueva-fam">Nueva familia</button>
+               <button class="btn-primario" id="btn-nueva-lic">Nueva licencia</button>
+             </div>`
+          : ""
+      }
+    </div>
+
+    <div class="pestanas" role="tablist">
+      ${Object.entries(PRODUCTOS)
+        .map(
+          ([k, v]) => `<button role="tab" data-producto="${k}" class="${k === clave ? "activa" : ""}"
+                         aria-selected="${k === clave}">${esc(v.titulo)}</button>`
+        )
+        .join("")}
+    </div>
+
+    <div class="tarjetas">
+      <div class="tarjeta cyan"><div class="etiqueta">Familias</div><div class="valor">${conCuenta.length}</div></div>
+      <div class="tarjeta"><div class="etiqueta">Licencias</div><div class="valor">${total}</div>
+        <div class="pie">${asignadas} asignadas · ${total - asignadas} sin asignar</div></div>
+      <div class="tarjeta ${libres ? "amarillo" : "cyan"}"><div class="etiqueta">Ranuras libres</div><div class="valor">${libres}</div></div>
+      <div class="tarjeta ${excedidas ? "rojo" : "cyan"}"><div class="etiqueta">Familias excedidas</div><div class="valor">${excedidas}</div></div>
+    </div>
+
+    <div class="filtros">
+      <div class="campo busqueda"><label>Buscar</label>
+        <input id="l-q" placeholder="${clave === "norton" ? "Nombre, usuario o código…" : "Nombre, correo o código…"}"></div>
+      ${filtrosUbicacion("l")}
+      <div class="campo check" style="padding-bottom:8px">
+        <input type="checkbox" id="l-libres"><label for="l-libres">Solo sin asignar</label></div>
+    </div>
+    <div id="familias"></div>`;
+
+  document.querySelectorAll("[data-producto]").forEach((b) => {
+    b.onclick = () => {
+      estado.licencias = b.dataset.producto;
+      verLicencias();
+    };
+  });
+  const volver = () => {
+    cerrarModal();
+    verLicencias();
+  };
+  if (puedeEditar()) {
+    $("#btn-familias").onclick = modalCuentasLicencia;
+    $("#btn-nueva-fam").onclick = () => modalCuenta(null, volver, p.producto);
+    $("#btn-nueva-lic").onclick = () => modalActivo(null, p.tipo, [p.tipo]);
+  }
+
+  const pintar = () => {
+    const q = $("#l-q").value.trim().toLowerCase();
+    const soloLibres = $("#l-libres").checked;
+    const ubicacion = Object.entries(valoresUbicacion("l"));
+    const filtrando = q || soloLibres || ubicacion.length;
+    const coincide = (l) =>
+      (!soloLibres || !l.empleado) &&
+      ubicacion.every(([campo, v]) => String(l[campo]) === v) &&
+      (!q ||
+        [l.codigo, l.empleado, l.correo_licencia, l.identificador]
+          .filter(Boolean)
+          .some((t) => t.toLowerCase().includes(q)));
+
+    const html = grupos
+      .map((g, i) => bloqueFamilia(g, i + 1, clave, g.licencias.filter(coincide), filtrando))
+      .filter(Boolean)
+      .join("");
+    $("#familias").innerHTML =
+      html || `<div class="panel"><div class="vacio">No hay licencias que coincidan.</div></div>`;
+
+    document.querySelectorAll("#familias tr[data-lic]").forEach((tr) => {
+      tr.onclick = () => verFichaActivo(tr.dataset.lic, "licencias");
+    });
+    if (!puedeEditar()) return;
+    const cuentaDe = (id) => grupos.find((g) => g.cuenta && String(g.cuenta.id) === id).cuenta;
+    const agregar = (id) =>
+      modalActivo(null, p.tipo, [p.tipo], { licencia: { cuenta_id: Number(id) } });
+    document.querySelectorAll("#familias [data-agregar]").forEach((b) => {
+      b.onclick = (e) => {
+        e.stopPropagation();
+        agregar(b.dataset.agregar);
+      };
+    });
+    document.querySelectorAll("#familias tr[data-ranura]").forEach((tr) => {
+      tr.onclick = () => agregar(tr.dataset.ranura);
+    });
+    document.querySelectorAll("#familias [data-editar-fam]").forEach((b) => {
+      b.onclick = () => modalCuenta(cuentaDe(b.dataset.editarFam), volver);
+    });
+  };
+  $("#l-q").oninput = pintar;
+  $("#l-libres").onchange = pintar;
+  enlazarUbicacion("l", pintar);
+  pintar();
+}
+
+function bloqueFamilia(g, numero, clave, licencias, filtrando) {
+  const c = g.cuenta;
+  if (filtrando && !licencias.length) return "";
+  const norton = clave === "norton";
+  const columnas = norton
+    ? ["#", "Código", "Nombre", "Usuario", "Sucursal", "Locación", "Depto", "Estatus"]
+    : ["#", "Código", "Nombre", "Correo", "Sucursal", "Locación", "Depto", "Estatus"];
+  const tope = LICENCIAS_POR_FAMILIA[PRODUCTOS[clave].tipo];
+  const ranuras = c ? c.ranuras_totales : licencias.length;
+  const cupo = c ? Math.min(tope, ranuras) : 0;
+  const usadas = g.licencias.length;
+  const excedida = c && usadas > ranuras;
+
+  const fila = (l, n) => `<tr class="clicable ${c && n > ranuras ? "excedente" : ""}" data-lic="${l.id}">
+      <td class="num-ranura">${n}</td>
+      <td><span class="codigo">${esc(l.codigo)}</span></td>
+      <td>${l.empleado ? esc(l.empleado) : '<span class="sin-asignar">Sin asignar</span>'}</td>
+      <td class="mono-celda">${esc((norton ? l.identificador : l.correo_licencia) || "—")}</td>
+      <td>${esc(l.sucursal || "—")}</td>
+      <td>${esc(l.bodega || l.planta || "—")}</td>
+      <td>${esc(l.departamento || "—")}</td>
+      <td><span class="insignia ${INSIGNIA_ESTATUS[l.estatus] || "neutra"}">${esc(l.estatus)}</span></td>
+    </tr>`;
+
+  const vacias =
+    c && !filtrando
+      ? Array.from({ length: Math.max(0, ranuras - usadas) }, (_, k) =>
+          `<tr class="ranura-libre ${puedeEditar() ? "clicable" : ""}" data-ranura="${c.id}">
+             <td class="num-ranura">${usadas + k + 1}</td>
+             <td colspan="${columnas.length - 1}">Libre</td></tr>`
+        ).join("")
+      : "";
+
+  const renovacion = c?.fecha_renovacion
+    ? (() => {
+        const dias = Math.round((new Date(c.fecha_renovacion + "T00:00:00") - new Date()) / 864e5);
+        const tono = dias < 0 ? "peligro" : dias <= 60 ? "alerta" : "ok";
+        return `<span class="insignia ${tono}">Renueva ${fecha(c.fecha_renovacion)}</span>`;
+      })()
+    : c
+    ? '<span class="insignia neutra">Sin fecha de renovación</span>'
+    : "";
+
+  return `<section class="familia ${excedida ? "excedida" : ""} ${c ? "" : "sin-familia"}">
+    <header class="familia-cab">
+      <div class="familia-titulo">
+        <span class="familia-num">${c ? numero : "?"}</span>
+        <div>
+          <b>${esc(c ? c.nombre : "Sin familia")}</b>
+          ${c?.correo_cuenta ? `<span class="familia-correo">${esc(c.correo_cuenta)}</span>` : ""}
+        </div>
+      </div>
+      <div class="familia-datos">
+        ${renovacion}
+        ${
+          c
+            ? `<div class="familia-uso" title="${usadas} de ${ranuras} ranuras">
+                 <div class="pista"><div class="relleno" style="width:${Math.min(100, (usadas / Math.max(1, ranuras)) * 100)}%"></div></div>
+                 <span>${usadas}/${ranuras}</span></div>`
+            : ""
+        }
+        ${
+          c && puedeEditar()
+            ? `<button class="btn-secundario btn-mini" data-agregar="${c.id}"
+                 ${usadas >= cupo ? `disabled title="Familia completa: ${cupo} de ${cupo}"` : ""}>${
+                   usadas >= cupo ? "Familia completa" : "Agregar licencia"
+                 }</button>
+               <button class="btn-secundario btn-mini" data-editar-fam="${c.id}">Editar</button>`
+            : ""
+        }
+      </div>
+    </header>
+    <div class="tabla-wrap"><table class="tabla-familia">
+      <thead><tr>${columnas.map((x) => `<th>${x}</th>`).join("")}</tr></thead>
+      <tbody>${licencias.map((l, k) => fila(l, k + 1)).join("")}${vacias}</tbody>
+    </table></div>
+  </section>`;
+}
+
