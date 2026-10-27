@@ -3292,3 +3292,765 @@ def marcar_verificacion(
     return dic_linea(linea, v, db)
 
 
+# --------------------------------------------------------------------------
+# Accesos a sistemas internos
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/empleados/{empleado_id}/accesos")
+def ver_accesos(
+    empleado_id: int, db: Session = Depends(obtener_sesion), _=Depends(usuario_actual)
+):
+    if db.get(Empleado, empleado_id) is None:
+        raise HTTPException(404, "Empleado no encontrado")
+    return accesos_de(db, empleado_id)
+
+
+@app.put("/api/empleados/{empleado_id}/accesos")
+def guardar_accesos(
+    empleado_id: int,
+    datos: schemas.AccesosEmpleadoIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    empleado = db.get(Empleado, empleado_id)
+    if empleado is None:
+        raise HTTPException(404, "Empleado no encontrado")
+
+    existentes = {
+        a.sistema_id: a
+        for a in db.query(AccesoSistema).filter(AccesoSistema.empleado_id == empleado_id)
+    }
+    entregados = []
+    for item in datos.accesos:
+        if db.get(SistemaInterno, item.sistema_id) is None:
+            raise HTTPException(404, f"Sistema {item.sistema_id} no encontrado")
+
+        acceso = existentes.get(item.sistema_id)
+        if acceso is None:
+            acceso = AccesoSistema(empleado_id=empleado_id, sistema_id=item.sistema_id)
+            db.add(acceso)
+
+        cambio = acceso.entregado != item.entregado
+        acceso.entregado = item.entregado
+        acceso.usuario_sistema = item.usuario_sistema
+        acceso.notas = item.notas
+        # Si se marca entregado y no se puso fecha, queda la de hoy
+        acceso.fecha_entrega = (
+            item.fecha_entrega or (hoy_local() if item.entregado else None)
+            if item.entregado
+            else None
+        )
+        if cambio:
+            acceso.actualizado_por = usuario.nombre
+            acceso.actualizado_en = dt.datetime.now(dt.timezone.utc)
+        if item.entregado:
+            entregados.append(str(item.sistema_id))
+
+    db.flush()
+    registrar(
+        db, usuario, "EDITAR", "accesos", empleado_id,
+        f"{empleado.nombre_completo}: {len(entregados)} sistema(s) entregado(s)",
+    )
+    db.commit()
+    return accesos_de(db, empleado_id)
+
+
+@app.get("/api/sistemas")
+def listar_sistemas(db: Session = Depends(obtener_sesion), _=Depends(usuario_actual)):
+    salida = []
+    for s in db.query(SistemaInterno).order_by(SistemaInterno.orden, SistemaInterno.nombre):
+        entregados = (
+            db.query(func.count(AccesoSistema.id))
+            .filter(AccesoSistema.sistema_id == s.id, AccesoSistema.entregado.is_(True))
+            .scalar()
+        )
+        salida.append(
+            {
+                "id": s.id,
+                "nombre": s.nombre,
+                "clave": s.clave,
+                "descripcion": s.descripcion,
+                "orden": s.orden,
+                "activo": s.activo,
+                "entregados": entregados,
+            }
+        )
+    return salida
+
+
+@app.post("/api/sistemas")
+def crear_sistema(
+    datos: schemas.SistemaIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    sistema = SistemaInterno(
+        nombre=datos.nombre.strip().upper(),
+        clave=datos.clave.strip().upper(),
+        descripcion=datos.descripcion,
+        orden=datos.orden,
+    )
+    db.add(sistema)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Ya existe un sistema con ese nombre o clave")
+    registrar(db, usuario, "CREAR", "sistema", sistema.id, sistema.nombre)
+    db.commit()
+    return {"id": sistema.id, "nombre": sistema.nombre}
+
+
+@app.put("/api/sistemas/{sistema_id}")
+def editar_sistema(
+    sistema_id: int,
+    datos: schemas.SistemaIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    sistema = db.get(SistemaInterno, sistema_id)
+    if sistema is None:
+        raise HTTPException(404, "Sistema no encontrado")
+    sistema.nombre = datos.nombre.strip().upper()
+    sistema.clave = datos.clave.strip().upper()
+    sistema.descripcion = datos.descripcion
+    sistema.orden = datos.orden
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Ya existe un sistema con ese nombre o clave")
+    registrar(db, usuario, "EDITAR", "sistema", sistema.id, sistema.nombre)
+    db.commit()
+    return {"id": sistema.id, "nombre": sistema.nombre}
+
+
+@app.delete("/api/sistemas/{sistema_id}")
+def eliminar_sistema(
+    sistema_id: int,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    sistema = db.get(SistemaInterno, sistema_id)
+    if sistema is None:
+        raise HTTPException(404, "Sistema no encontrado")
+    en_uso = (
+        db.query(func.count(AccesoSistema.id))
+        .filter(AccesoSistema.sistema_id == sistema_id, AccesoSistema.entregado.is_(True))
+        .scalar()
+    )
+    if en_uso:
+        raise HTTPException(
+            409, f"No se puede eliminar: {en_uso} persona(s) tienen este acceso registrado."
+        )
+    nombre = sistema.nombre
+    db.query(AccesoSistema).filter(AccesoSistema.sistema_id == sistema_id).delete()
+    db.delete(sistema)
+    registrar(db, usuario, "ELIMINAR", "sistema", sistema_id, nombre)
+    db.commit()
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# Auditoria semanal
+# --------------------------------------------------------------------------
+
+
+def dic_item(i: ItemAuditoria) -> dict:
+    return {
+        "id": i.id,
+        "orden": i.orden,
+        "categoria": i.categoria,
+        "descripcion": i.descripcion,
+        "automatico": i.automatico,
+        "estado": i.estado.value,
+        "observacion": i.observacion,
+        "activo_id": i.activo_id,
+        "activo": i.activo.codigo if i.activo else None,
+        "actualizado_por": i.actualizado_por,
+        "actualizado_en": i.actualizado_en,
+        "evidencias": [dic_evidencia(e) for e in i.evidencias],
+    }
+
+
+def dic_evidencia(e: EvidenciaAuditoria) -> dict:
+    return {
+        "id": e.id,
+        "item_id": e.item_id,
+        "nombre": e.nombre,
+        "url": e.url,
+        "agregado_por": e.agregado_por,
+        "agregado_en": e.agregado_en,
+    }
+
+
+def resumen_auditoria(a: Auditoria) -> dict:
+    conteo = {e.value: 0 for e in EstadoItem}
+    for i in a.items:
+        conteo[i.estado.value] += 1
+    total = len(a.items)
+    revisados = total - conteo["PENDIENTE"]
+    return {
+        "id": a.id,
+        "tipo": a.tipo.value,
+        "fecha_inicio": a.fecha_inicio,
+        "fecha_fin": a.fecha_fin,
+        "estado": a.estado.value,
+        "analista_id": a.analista_id,
+        "analista": a.analista_nombre,
+        "programada_por": a.programada_por,
+        "observaciones": a.observaciones,
+        "dias_sin_actividad": a.dias_sin_actividad,
+        "fecha_cierre": a.fecha_cierre,
+        "cerrada_por": a.cerrada_por,
+        "total": total,
+        "revisados": revisados,
+        "avance": round(revisados / total * 100) if total else 0,
+        "conteo": conteo,
+        "incidencias": conteo["INCIDENCIA"],
+    }
+
+
+@app.get("/api/auditorias")
+def listar_auditorias(
+    tipo: TipoAuditoria | None = None,
+    db: Session = Depends(obtener_sesion),
+    _=Depends(usuario_actual),
+):
+    consulta = db.query(Auditoria)
+    if tipo:
+        consulta = consulta.filter(Auditoria.tipo == tipo)
+    return [
+        resumen_auditoria(a)
+        for a in consulta.order_by(Auditoria.fecha_inicio.desc(), Auditoria.tipo).all()
+    ]
+
+
+NOMBRE_AUDITORIA = {
+    TipoAuditoria.CORREO: "Correo",
+    TipoAuditoria.NORTON: "Norton",
+}
+ETIQUETA_ITEM = {
+    EstadoItem.PENDIENTE: "Sin revisar",
+    EstadoItem.CONFORME: "Conforme",
+    EstadoItem.INCIDENCIA: "Incidencia",
+    EstadoItem.NO_APLICA: "No aplica",
+}
+MESES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+    "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
+
+
+def _texto_fecha(valor) -> str:
+    if isinstance(valor, dt.datetime):
+        return f"{a_hora_local(valor):%d/%m/%Y %H:%M}"
+    if isinstance(valor, dt.date):
+        return f"{valor:%d/%m/%Y}"
+    return ""
+
+
+@app.get("/api/auditorias/reporte-mensual")
+def reporte_mensual_auditoria(
+    ids: list[int] = Query(..., min_length=1, max_length=6),
+    db: Session = Depends(obtener_sesion),
+    _=Depends(usuario_actual),
+):
+    """Concentra en un Excel las auditorías semanales elegidas."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    auditorias = (
+        db.query(Auditoria)
+        .filter(Auditoria.id.in_(ids))
+        .order_by(Auditoria.fecha_inicio)
+        .all()
+    )
+    if len(auditorias) != len(set(ids)):
+        raise HTTPException(404, "Alguna de las auditorías elegidas no existe")
+    tipos = {a.tipo for a in auditorias}
+    if len(tipos) > 1:
+        raise HTTPException(400, "Las auditorías elegidas deben ser del mismo tipo")
+    tipo = tipos.pop()
+    referencia = auditorias[len(auditorias) // 2].fecha_fin
+    anio, numero = referencia.year, referencia.month
+    mes = f"{anio}-{numero:02d}"
+
+    titulo = f"Auditoría de {NOMBRE_AUDITORIA[tipo]} · {MESES[numero - 1]} {anio}"
+    negrita = Font(bold=True)
+    relleno = PatternFill("solid", fgColor="DDEBF7")
+    colores = {
+        EstadoItem.CONFORME: "C6EFCE",
+        EstadoItem.INCIDENCIA: "FFC7CE",
+        EstadoItem.PENDIENTE: "FFEB9C",
+        EstadoItem.NO_APLICA: "EDEDED",
+    }
+
+    def encabezado(hoja, columnas: list[str], fila: int = 1) -> None:
+        for i, texto in enumerate(columnas, start=1):
+            celda = hoja.cell(row=fila, column=i, value=texto)
+            celda.font = negrita
+            celda.fill = relleno
+            celda.alignment = Alignment(vertical="center", wrap_text=True)
+
+    def anchos(hoja, medidas: list[int]) -> None:
+        for i, ancho in enumerate(medidas, start=1):
+            hoja.column_dimensions[get_column_letter(i)].width = ancho
+
+    def ajustar(hoja, desde: int = 2) -> None:
+        for fila in hoja.iter_rows(min_row=desde):
+            for celda in fila:
+                celda.alignment = Alignment(wrap_text=True, vertical="top")
+
+    ordenados = {a.id: sorted(a.items, key=lambda x: (x.orden, x.id)) for a in auditorias}
+    semana = {a.id: f"{a.fecha_inicio:%d/%m} — {a.fecha_fin:%d/%m/%Y}" for a in auditorias}
+    wb = Workbook()
+
+    hoja = wb.active
+    hoja.title = "Resumen"
+    hoja["A1"] = titulo
+    hoja["A1"].font = Font(bold=True, size=14)
+    encabezado(
+        hoja,
+        ["Semana", "Analista", "Estado", "Puntos", "Conformes", "Incidencias", "No aplica",
+         "Sin revisar", "Avance", "Evidencias", "Cerrada por", "Fecha de cierre", "Observaciones"],
+        3,
+    )
+    totales = [0] * 6
+    for a in auditorias:
+        r = resumen_auditoria(a)
+        cifras = [
+            r["total"], r["conteo"]["CONFORME"], r["conteo"]["INCIDENCIA"],
+            r["conteo"]["NO_APLICA"], r["conteo"]["PENDIENTE"],
+            sum(len(i.evidencias) for i in a.items),
+        ]
+        totales = [t + c for t, c in zip(totales, cifras)]
+        hoja.append([
+            semana[a.id], a.analista_nombre or "",
+            "Cerrada" if a.estado == EstadoAuditoria.CERRADA else "En proceso",
+            *cifras[:5], f"{r['avance']}%", cifras[5], a.cerrada_por or "",
+            _texto_fecha(a.fecha_cierre), a.observaciones or "",
+        ])
+    cerradas = sum(a.estado == EstadoAuditoria.CERRADA for a in auditorias)
+    revisados = totales[0] - totales[4]
+    hoja.append([
+        "Total del mes", "", f"{cerradas} de {len(auditorias)} cerradas", *totales[:5],
+        f"{round(revisados / totales[0] * 100) if totales[0] else 0}%", totales[5],
+    ])
+    for celda in hoja[hoja.max_row]:
+        celda.font = negrita
+    ajustar(hoja, 4)
+    anchos(hoja, [22, 24, 18, 9, 11, 12, 10, 12, 9, 11, 22, 18, 50])
+
+    # Cada punto contra las semanas del mes; primero los de la plantilla
+    hoja = wb.create_sheet("Concentrado")
+    encabezado(hoja, ["Categoría", "Punto"] + [semana[a.id] for a in auditorias])
+    filas: dict[tuple[str, str], list] = {}
+    for indice, a in enumerate(auditorias):
+        for i in ordenados[a.id]:
+            filas.setdefault((i.categoria, i.descripcion), [None] * len(auditorias))[indice] = i.estado
+    plantilla = {d for _, d in PLANTILLAS[tipo]}
+    for (categoria, descripcion), estados in sorted(
+        filas.items(), key=lambda f: f[0][1] not in plantilla and not f[0][1].startswith("Notificar")
+    ):
+        hoja.append([categoria, descripcion] + [ETIQUETA_ITEM[e] if e else "" for e in estados])
+        for columna, e in enumerate(estados, start=3):
+            if e:
+                hoja.cell(row=hoja.max_row, column=columna).fill = PatternFill(
+                    "solid", fgColor=colores[e]
+                )
+    ajustar(hoja)
+    anchos(hoja, [24, 70] + [18] * len(auditorias))
+
+    hoja = wb.create_sheet("Detalle")
+    encabezado(hoja, ["Semana", "Categoría", "Punto", "Estado", "Observación",
+                      "Revisó", "Fecha de revisión", "Evidencias"])
+    for a in auditorias:
+        for i in ordenados[a.id]:
+            hoja.append([
+                semana[a.id], i.categoria, i.descripcion, ETIQUETA_ITEM[i.estado],
+                i.observacion or "", i.actualizado_por or "", _texto_fecha(i.actualizado_en),
+                len(i.evidencias),
+            ])
+            hoja.cell(row=hoja.max_row, column=4).fill = PatternFill(
+                "solid", fgColor=colores[i.estado]
+            )
+    ajustar(hoja)
+    anchos(hoja, [22, 22, 60, 12, 45, 22, 18, 11])
+
+    hoja = wb.create_sheet("Evidencias")
+    encabezado(hoja, ["Semana", "Categoría", "Punto", "Archivo", "Enlace", "Agregó", "Fecha"])
+    for a in auditorias:
+        for i in ordenados[a.id]:
+            for e in i.evidencias:
+                hoja.append([
+                    semana[a.id], i.categoria, i.descripcion, e.nombre, e.url,
+                    e.agregado_por or "", _texto_fecha(e.agregado_en),
+                ])
+                enlace = hoja.cell(row=hoja.max_row, column=5)
+                enlace.hyperlink = e.url
+                enlace.font = Font(color="0563C1", underline="single")
+    ajustar(hoja)
+    anchos(hoja, [22, 22, 50, 32, 50, 22, 18])
+
+    _neutralizar_formulas(wb)
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    nombre = f"auditoria_{tipo.value.lower()}_{mes}.xlsx"
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{nombre}"'},
+    )
+
+
+@app.get("/api/auditorias/{auditoria_id}")
+def ver_auditoria(
+    auditoria_id: int, db: Session = Depends(obtener_sesion), _=Depends(usuario_actual)
+):
+    auditoria = db.get(Auditoria, auditoria_id)
+    if auditoria is None:
+        raise HTTPException(404, "Auditoría no encontrada")
+    datos = resumen_auditoria(auditoria)
+    datos["items"] = [
+        dic_item(i) for i in sorted(auditoria.items, key=lambda x: (x.orden, x.id))
+    ]
+    return datos
+
+
+@app.post("/api/auditorias")
+def crear_auditoria(
+    datos: schemas.AuditoriaIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_admin),
+):
+    # Primero los datos de entrada, después el conflicto de estado
+    analista = db.get(Usuario, datos.analista_id)
+    if analista is None or not analista.activo:
+        raise HTTPException(404, "El analista indicado no existe o está desactivado")
+
+    inicio, fin = semana_de(datos.fecha or hoy_local())
+    existe = (
+        db.query(Auditoria)
+        .filter(Auditoria.tipo == datos.tipo, Auditoria.fecha_inicio == inicio)
+        .first()
+    )
+    if existe:
+        raise HTTPException(
+            409,
+            f"Ya existe la auditoría de {datos.tipo.value.lower()} para la semana del "
+            f"{inicio:%d/%m/%Y}",
+        )
+
+    auditoria = Auditoria(
+        tipo=datos.tipo,
+        fecha_inicio=inicio,
+        fecha_fin=fin,
+        analista_id=analista.id,
+        analista_nombre=analista.nombre,
+        programada_por=usuario.nombre,
+    )
+    if datos.tipo == TipoAuditoria.NORTON:
+        auditoria.dias_sin_actividad = datos.dias_sin_actividad or DIAS_SIN_ACTIVIDAD
+    auditoria.items = construir_items(db, datos.tipo, inicio, fin, auditoria.dias_sin_actividad)
+    db.add(auditoria)
+    db.flush()
+    registrar(
+        db, usuario, "PROGRAMAR", "auditoria", auditoria.id,
+        f"{datos.tipo.value} semana del {inicio:%d/%m/%Y} → {analista.nombre} "
+        f"({len(auditoria.items)} puntos)",
+    )
+    db.commit()
+    return ver_auditoria(auditoria.id, db)
+
+
+@app.put("/api/auditorias/{auditoria_id}")
+def editar_auditoria(
+    auditoria_id: int,
+    datos: schemas.AuditoriaEditarIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    auditoria = db.get(Auditoria, auditoria_id)
+    if auditoria is None:
+        raise HTTPException(404, "Auditoría no encontrada")
+
+    if datos.estado == EstadoAuditoria.CERRADA and auditoria.estado != EstadoAuditoria.CERRADA:
+        sin_revisar = [i for i in auditoria.items if i.estado == EstadoItem.PENDIENTE]
+        if sin_revisar:
+            raise HTTPException(
+                409,
+                f"Faltan {len(sin_revisar)} punto(s) por revisar. "
+                "Márcalos como conforme, incidencia o no aplica antes de cerrar.",
+            )
+        auditoria.fecha_cierre = dt.datetime.now(dt.timezone.utc)
+        auditoria.cerrada_por = usuario.nombre
+    elif datos.estado == EstadoAuditoria.EN_PROCESO:
+        auditoria.fecha_cierre = None
+        auditoria.cerrada_por = None
+
+    auditoria.estado = datos.estado
+    auditoria.observaciones = datos.observaciones
+    # Reasignar el analista es potestad del administrador
+    if datos.analista_id and datos.analista_id != auditoria.analista_id:
+        if usuario.rol != RolUsuario.ADMIN:
+            raise HTTPException(403, "Sólo un administrador puede reasignar la auditoría")
+        nuevo = db.get(Usuario, datos.analista_id)
+        if nuevo is None or not nuevo.activo:
+            raise HTTPException(404, "El analista indicado no existe o está desactivado")
+        auditoria.analista_id = nuevo.id
+        auditoria.analista_nombre = nuevo.nombre
+    registrar(db, usuario, "EDITAR", "auditoria", auditoria.id, datos.estado.value)
+    db.commit()
+    return ver_auditoria(auditoria_id, db)
+
+
+@app.put("/api/auditorias/items/{item_id}")
+def actualizar_item(
+    item_id: int,
+    datos: schemas.ItemAuditoriaIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    item = db.get(ItemAuditoria, item_id)
+    if item is None:
+        raise HTTPException(404, "Punto no encontrado")
+    if item.auditoria.estado == EstadoAuditoria.CERRADA:
+        raise HTTPException(409, "La auditoría está cerrada. Reábrela para modificarla.")
+    if datos.estado == EstadoItem.INCIDENCIA and not (datos.observacion or "").strip():
+        raise HTTPException(400, "Una incidencia necesita que describas qué pasó")
+
+    item.estado = datos.estado
+    item.observacion = datos.observacion
+    item.actualizado_por = usuario.nombre
+    item.actualizado_en = dt.datetime.now(dt.timezone.utc)
+    db.commit()
+    return dic_item(item)
+
+
+@app.post("/api/auditorias/{auditoria_id}/items")
+def agregar_item(
+    auditoria_id: int,
+    datos: schemas.ItemExtraIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    auditoria = db.get(Auditoria, auditoria_id)
+    if auditoria is None:
+        raise HTTPException(404, "Auditoría no encontrada")
+    if auditoria.estado == EstadoAuditoria.CERRADA:
+        raise HTTPException(409, "La auditoría está cerrada")
+
+    item = ItemAuditoria(
+        auditoria_id=auditoria_id,
+        orden=max((i.orden for i in auditoria.items), default=0) + 1,
+        categoria=datos.categoria,
+        descripcion=datos.descripcion,
+    )
+    db.add(item)
+    db.flush()
+    registrar(db, usuario, "CREAR", "item_auditoria", item.id, datos.descripcion[:80])
+    db.commit()
+    return dic_item(item)
+
+
+DOMINIOS_DRIVE = ("drive.google.com", "docs.google.com")
+
+
+@app.post("/api/auditorias/items/{item_id}/evidencias")
+def agregar_evidencia(
+    item_id: int,
+    datos: schemas.EvidenciaIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    item = db.get(ItemAuditoria, item_id)
+    if item is None:
+        raise HTTPException(404, "Punto no encontrado")
+    if item.auditoria.estado == EstadoAuditoria.CERRADA:
+        raise HTTPException(409, "La auditoría está cerrada. Reábrela para modificarla.")
+    if item.auditoria.tipo == TipoAuditoria.NORTON and item.estado != EstadoItem.INCIDENCIA:
+        raise HTTPException(409, "Solo se agregan evidencias a los puntos con incidencia")
+    url = datos.url.strip()
+    partes = urlparse(url)
+    if partes.scheme != "https" or partes.hostname not in DOMINIOS_DRIVE:
+        raise HTTPException(400, "La evidencia debe ser un enlace de Google Drive")
+
+    evidencia = EvidenciaAuditoria(
+        item_id=item.id,
+        nombre=(datos.nombre or "").strip() or "Archivo de Drive",
+        url=url,
+        agregado_por=usuario.nombre,
+    )
+    db.add(evidencia)
+    db.flush()
+    registrar(db, usuario, "CREAR", "evidencia_auditoria", evidencia.id, evidencia.nombre)
+    db.commit()
+    return dic_evidencia(evidencia)
+
+
+@app.delete("/api/auditorias/evidencias/{evidencia_id}")
+def eliminar_evidencia(
+    evidencia_id: int,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    evidencia = db.get(EvidenciaAuditoria, evidencia_id)
+    if evidencia is None:
+        raise HTTPException(404, "Evidencia no encontrada")
+    if evidencia.item.auditoria.estado == EstadoAuditoria.CERRADA:
+        raise HTTPException(409, "La auditoría está cerrada. Reábrela para modificarla.")
+    nombre = evidencia.nombre
+    db.delete(evidencia)
+    registrar(db, usuario, "ELIMINAR", "evidencia_auditoria", evidencia_id, nombre)
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/api/auditorias/{auditoria_id}")
+def eliminar_auditoria(
+    auditoria_id: int,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_admin),
+):
+    auditoria = db.get(Auditoria, auditoria_id)
+    if auditoria is None:
+        raise HTTPException(404, "Auditoría no encontrada")
+    etiqueta = f"{auditoria.tipo.value} semana del {auditoria.fecha_inicio:%d/%m/%Y}"
+    db.delete(auditoria)
+    registrar(db, usuario, "ELIMINAR", "auditoria", auditoria_id, etiqueta)
+    db.commit()
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# Datos para las graficas
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/graficas/movimientos")
+def grafica_movimientos(
+    meses: int = Query(12, ge=3, le=36),
+    db: Session = Depends(obtener_sesion),
+    _=Depends(usuario_actual),
+):
+    """Asignaciones y devoluciones por mes.
+
+    Una reasignación no es un movimiento aparte: es la devolución de un
+    activo más la asignación siguiente, y así aparece en la serie.
+    """
+    hoy = hoy_local()
+    periodos: list[dict] = []
+    anio, mes = hoy.year, hoy.month
+    for _i in range(meses):
+        periodos.append({"anio": anio, "mes": mes})
+        mes -= 1
+        if mes == 0:
+            mes, anio = 12, anio - 1
+    periodos.reverse()
+    inicio = dt.date(periodos[0]["anio"], periodos[0]["mes"], 1)
+
+    def por_mes(columna):
+        filas = (
+            db.query(
+                func.strftime("%Y-%m", columna).label("periodo"),
+                func.count(Asignacion.id),
+            )
+            .join(Activo, Activo.id == Asignacion.activo_id)
+            .filter(columna.isnot(None), columna >= inicio, Activo.tipo.in_(TIPOS_FISICOS))
+            .group_by("periodo")
+            .all()
+        )
+        return {periodo: total for periodo, total in filas}
+
+    asignaciones = por_mes(Asignacion.fecha_asignacion)
+    devoluciones = por_mes(Asignacion.fecha_devolucion)
+
+    NOMBRES = ["ene", "feb", "mar", "abr", "may", "jun",
+               "jul", "ago", "sep", "oct", "nov", "dic"]
+    salida = []
+    for periodo in periodos:
+        clave = f"{periodo['anio']:04d}-{periodo['mes']:02d}"
+        salida.append(
+            {
+                "periodo": clave,
+                "etiqueta": f"{NOMBRES[periodo['mes'] - 1]} {periodo['anio'] % 100:02d}",
+                "asignaciones": asignaciones.get(clave, 0),
+                "devoluciones": devoluciones.get(clave, 0),
+            }
+        )
+
+    # Activos que han pasado por más de una persona
+    reasignados = (
+        db.query(func.count(Asignacion.activo_id))
+        .group_by(Asignacion.activo_id)
+        .having(func.count(Asignacion.id) > 1)
+        .count()
+    )
+    return {
+        "serie": salida,
+        "total_asignaciones": sum(s["asignaciones"] for s in salida),
+        "total_devoluciones": sum(s["devoluciones"] for s in salida),
+        "activos_reasignados": reasignados,
+    }
+
+
+@app.get("/api/graficas/top-empleados")
+def grafica_top_empleados(
+    limite: int = Query(10, ge=3, le=30),
+    db: Session = Depends(obtener_sesion),
+    _=Depends(usuario_actual),
+):
+    """Quién concentra más activos vigentes, con el desglose por tipo."""
+    filas = (
+        db.query(Empleado, func.count(Asignacion.id).label("total"))
+        .join(Asignacion, (Asignacion.empleado_id == Empleado.id))
+        .join(Activo, Activo.id == Asignacion.activo_id)
+        .filter(Asignacion.fecha_devolucion.is_(None), Activo.tipo.in_(TIPOS_FISICOS))
+        .group_by(Empleado.id)
+        .order_by(func.count(Asignacion.id).desc())
+        .limit(limite)
+        .all()
+    )
+
+    salida = []
+    for empleado, total in filas:
+        por_tipo = dict(
+            db.query(Activo.tipo, func.count(Activo.id))
+            .join(Asignacion, Asignacion.activo_id == Activo.id)
+            .filter(
+                Asignacion.empleado_id == empleado.id,
+                Asignacion.fecha_devolucion.is_(None),
+                Activo.tipo.in_(TIPOS_FISICOS),
+            )
+            .group_by(Activo.tipo)
+            .all()
+        )
+        salida.append(
+            {
+                "empleado_id": empleado.id,
+                "codigo": empleado.codigo,
+                "nombre": empleado.nombre_completo,
+                "departamento": empleado.departamento.nombre if empleado.departamento else None,
+                "sucursal": empleado.sucursal.nombre if empleado.sucursal else None,
+                "total": total,
+                "por_tipo": {t.value: n for t, n in por_tipo.items()},
+            }
+        )
+    return salida
+
+
+# --------------------------------------------------------------------------
+# Archivos estaticos
+# --------------------------------------------------------------------------
+
+
+@app.get("/")
+def raiz():
+    return FileResponse(ESTATICOS / "index.html")
+
+
+app.mount("/", StaticFiles(directory=ESTATICOS), name="static")
