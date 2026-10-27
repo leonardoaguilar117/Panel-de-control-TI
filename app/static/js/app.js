@@ -2147,3 +2147,787 @@ function bloqueFamilia(g, numero, clave, licencias, filtrando) {
   </section>`;
 }
 
+// ---------------------------------------------------------------- secciones de activos
+
+async function verSeccion(clave) {
+  const s = SECCIONES[clave];
+
+  $("#vista").innerHTML = `
+    <div class="encabezado">
+      <div><h2>${esc(s.titulo)}</h2><p>${esc(s.sub)}</p></div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        ${
+          EXPORTABLES.includes(clave)
+            ? `<button class="btn-secundario" id="btn-exportar">Exportar a Excel</button>`
+            : ""
+        }
+        ${
+          puedeEditar() && clave === "correos"
+            ? `<button class="btn-secundario" id="btn-importar-correos">Importar actividad</button>
+               <input type="file" id="archivo-correos" accept=".xlsx" hidden>`
+            : ""
+        }
+        ${
+          puedeEditar()
+            ? `<button class="btn-primario" id="btn-nuevo-act">${
+                clave === "equipos" ? "Nuevo equipo" : clave === "tabletas" ? "Nueva tablet" : "Nuevo registro"
+              }</button>`
+            : ""
+        }
+      </div>
+    </div>
+    <div class="filtros">
+      <div class="campo busqueda"><label>Buscar</label>
+        <input id="a-q" placeholder="Código, serie, IMEI, teléfono o correo…"></div>
+      ${
+        s.tipos.length > 1
+          ? `<div class="campo"><label>Tipo</label>
+             <select id="a-tipo">${opciones(s.tipos, "", "Todos")}</select></div>`
+          : ""
+      }
+      <div class="campo"><label>Estatus</label>
+        <select id="a-est">${opciones(estado.catalogos.estatus_activo, "", "Todos")}</select></div>
+      ${filtrosUbicacion("a")}
+      <div class="campo check" style="padding-bottom:8px">
+        <input type="checkbox" id="a-libres"><label for="a-libres">Solo sin asignar</label></div>
+    </div>
+    <div id="tabla-activos"></div>`;
+
+  const bExp = $("#btn-exportar");
+  if (bExp) bExp.onclick = () => (location.href = "/api/activos/exportar?" + filtrosSeccion(clave));
+  if (puedeEditar()) {
+    $("#btn-nuevo-act").onclick = () =>
+      clave === "equipos" || clave === "tabletas"
+        ? modalAltaEquipo(s.tipoNuevo)
+        : modalActivo(null, s.tipoNuevo, s.tipos);
+  }
+  if (puedeEditar() && clave === "correos") {
+    const archivo = $("#archivo-correos");
+    $("#btn-importar-correos").onclick = () => archivo.click();
+    archivo.onchange = async () => {
+      if (!archivo.files.length) return;
+      const datos = new FormData();
+      datos.append("archivo", archivo.files[0]);
+      archivo.value = "";
+      try {
+        const r = await api("/api/correos/importar-actividad", { method: "POST", body: datos });
+        resumenImportacion(r);
+        cargarSeccion(clave);
+        refrescarContadorAlertas();
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+  }
+
+  ["a-q", "a-tipo", "a-est", "a-libres"].forEach((id) => {
+    const el = $("#" + id);
+    if (!el) return;
+    el.oninput = () => cargarSeccion(clave);
+    el.onchange = () => cargarSeccion(clave);
+  });
+  enlazarUbicacion("a", () => cargarSeccion(clave));
+  cargarSeccion(clave);
+}
+
+function resumenImportacion(r) {
+  abrirModal(
+    "Actividad importada",
+    `<div class="rejilla">
+      <div class="campo"><label>Cuentas actualizadas</label><div>${r.actualizados}</div></div>
+      <div class="campo"><label>En desuso (${DIAS_DESUSO_CORREO}+ días)</label><div>${r.en_desuso}</div></div>
+      <div class="campo"><label>No registradas</label><div>${r.no_registrados.length}</div></div>
+    </div>
+    ${
+      r.inactivos_no_registrados.length
+        ? `<h3 style="font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--texto-tenue);margin:16px 0 8px">
+             No registradas con ${DIAS_DESUSO_CORREO}+ días sin acceso (${r.inactivos_no_registrados.length})</h3>
+           <div class="tabla-wrap" style="max-height:300px;overflow:auto"><table>
+             <thead><tr><th>Correo</th><th>Último acceso</th><th class="num">GB</th></tr></thead>
+             <tbody>${r.inactivos_no_registrados
+               .map(
+                 (c) => `<tr>
+                   <td class="codigo">${esc(c.direccion)}</td>
+                   <td>${
+                     c.ultimo_acceso
+                       ? `${new Date(c.ultimo_acceso).toLocaleDateString("es-MX")}
+                          <span class="insignia alerta">${c.dias_sin_acceso} días sin uso</span>`
+                       : '<span class="insignia peligro">Nunca</span>'
+                   }</td>
+                   <td class="num">${c.almacenamiento_gb ?? "—"}</td></tr>`
+               )
+               .join("")}</tbody></table></div>`
+        : ""
+    }`,
+    `<button class="btn-secundario" id="ir-alertas">Ver alertas</button>
+     <button class="btn-primario" id="cerrar-resumen">Cerrar</button>`
+  );
+  $("#cerrar-resumen").onclick = cerrarModal;
+  $("#ir-alertas").onclick = () => {
+    cerrarModal();
+    irA("alertas");
+  };
+}
+
+function filtrosSeccion(clave) {
+  const params = new URLSearchParams({ grupo: clave });
+  const q = $("#a-q").value.trim();
+  if (q) params.set("q", q);
+  const selTipo = $("#a-tipo");
+  if (selTipo && selTipo.value) params.set("tipo", selTipo.value);
+  if ($("#a-est").value) params.set("estatus", $("#a-est").value);
+  if ($("#a-libres").checked) params.set("sin_asignar", "true");
+  Object.entries(valoresUbicacion("a")).forEach(([k, v]) => params.set(k, v));
+  return params;
+}
+
+async function cargarSeccion(clave) {
+  const s = SECCIONES[clave];
+  const activos = await api("/api/activos?" + filtrosSeccion(clave));
+  $("#tabla-activos").innerHTML = activos.length
+    ? `<div class="tabla-wrap"><table>
+        <thead><tr>${s.columnas.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead>
+        <tbody>${activos
+          .map(
+            (a) =>
+              `<tr class="clicable" data-id="${a.id}">${s
+                .fila(a)
+                .map((celda) => `<td>${celda}</td>`)
+                .join("")}</tr>`
+          )
+          .join("")}</tbody></table></div>`
+    : `<div class="panel"><div class="vacio">No hay registros que coincidan.</div></div>`;
+
+  document
+    .querySelectorAll("#tabla-activos tr.clicable")
+    .forEach((tr) => (tr.onclick = () => verFichaActivo(tr.dataset.id, clave)));
+}
+
+const ETIQUETAS_DETALLE = {
+  marca: "Marca", modelo: "Modelo", numero_serie: "Número de serie",
+  procesador: "Procesador", ram_gb: "RAM (GB)", almacenamiento: "Almacenamiento",
+  sistema_operativo: "Sistema operativo", clave_windows: "Clave Windows",
+  imei: "IMEI", numero_telefonico: "Teléfono",
+  iccid: "ICCID", operador: "Operador", precio_plan: "Plan", esquema: "Esquema",
+  esim: "eSIM", cuenta_operador: "Cuenta operador",
+  direccion: "Dirección", habilitada: "Cuenta activa",
+  ultimo_acceso: "Último acceso", almacenamiento_gb: "Almacenamiento (GB)",
+  dias_sin_acceso: "Días sin acceso",
+  familia: "Familia", correo_familia: "Correo de la familia",
+  ranuras_familia: "Ranuras de la familia",
+  correo_licencia: "Correo de la licencia",
+  identificador_dispositivo: "Identificador",
+};
+
+const OCULTOS_FICHA = ["cuenta_id", "actividad_importada_en", "nunca_accedio"];
+const FORMATO_DETALLE = { precio_plan: moneda, ultimo_acceso: fechaHora };
+// Ningún dispositivo vence, los correos no se renuevan
+// y las licencias toman la renovación de su familia
+const LICENCIAS = ["LICENCIA_MICROSOFT", "LICENCIA_NORTON"];
+const SIN_VENCIMIENTO = ["COMPUTO", "TELEFONO", "TABLETA", "CORREO_WORKSPACE", ...LICENCIAS];
+
+async function verFichaActivo(id, seccion) {
+  const a = await api(`/api/activos/${id}`);
+  const detalle = { ...a.movil, ...a.computo, ...a.correo, ...a.licencia };
+
+  abrirModal(
+    `${a.codigo} — ${TIPOS[a.tipo] || a.tipo}`,
+    `<div class="rejilla">
+      <div class="campo"><label>Estatus</label><div>${insigniaEstatus(a)}</div></div>
+      <div class="campo"><label>Descripción</label><div>${esc(a.descripcion || "—")}</div></div>
+      ${
+        LICENCIAS.includes(a.tipo)
+          ? ""
+          : `<div class="campo"><label>Adquisición</label><div>${fecha(a.fecha_adquisicion)}</div></div>`
+      }
+      ${
+        SIN_VENCIMIENTO.includes(a.tipo)
+          ? ""
+          : `<div class="campo"><label>Vencimiento</label><div>${fecha(a.fecha_vencimiento)}</div></div>`
+      }
+      ${Object.entries(detalle)
+        .filter(([k, v]) => v !== null && v !== undefined && v !== "" && !OCULTOS_FICHA.includes(k))
+        .map(
+          ([k, v]) =>
+            `<div class="campo"><label>${esc(ETIQUETAS_DETALLE[k] || k)}</label><div>${esc(
+              typeof v === "boolean" ? (v ? "Sí" : "No") : (FORMATO_DETALLE[k] || String)(v)
+            )}</div></div>`
+        )
+        .join("")}
+      ${
+        detalle.nunca_accedio
+          ? `<div class="campo"><label>Último acceso</label><div>Nunca ha iniciado sesión</div></div>`
+          : ""
+      }
+    </div>
+
+    <h3 style="font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--texto-tenue);margin:16px 0 10px">
+      Asignación vigente</h3>
+    ${
+      a.asignado_a
+        ? `<div style="margin-bottom:10px">${esc(a.asignado_a.empleado)}
+             <span class="codigo">(${esc(a.asignado_a.codigo_empleado)})</span>
+             desde ${fecha(a.asignado_a.fecha_asignacion)}</div>
+           ${
+             a.lleva_responsiva
+               ? filaDocumento(a.asignado_a, "responsiva") +
+                 (a.lleva_ine ? filaDocumento(a.asignado_a, "ine") : "")
+               : `<div style="color:var(--texto-tenue);font-size:15px">Sin responsiva.</div>`
+           }`
+        : `<div class="vacio" style="padding:16px">Este activo está libre.</div>`
+    }
+
+    ${
+      a.historial.length
+        ? `<h3 style="font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--texto-tenue);margin:18px 0 8px">
+           Historial de asignaciones</h3>
+           <div class="tabla-wrap"><table><thead><tr><th>Empleado</th><th>Desde</th><th>Hasta</th><th>Motivo</th>${
+             a.lleva_responsiva ? "<th>Documentos</th>" : ""
+           }</tr></thead>
+           <tbody>${a.historial
+             .map(
+               (h) => `<tr><td>${esc(h.empleado)}</td><td>${fecha(h.fecha_asignacion)}</td>
+               <td>${h.fecha_devolucion ? fecha(h.fecha_devolucion) : '<span class="insignia ok">Vigente</span>'}</td>
+               <td>${esc(h.motivo_devolucion || "—")}</td>${
+                 a.lleva_responsiva ? `<td>${celdaDocumentosHistorial(h)}</td>` : ""
+               }</tr>`
+             )
+             .join("")}</tbody></table></div>`
+        : ""
+    }`,
+    puedeEditar()
+      ? `<button class="btn-peligro" id="btn-borrar-act">Eliminar</button>
+         ${
+           a.asignado_a
+             ? `${a.lleva_responsiva ? '<button class="btn-secundario" id="btn-docs">Documentos</button>' : ""}
+                <button class="btn-secundario" id="btn-dev">Devolver</button>`
+             : `<button class="btn-primario" id="btn-asig">Asignar</button>`
+         }
+         <button class="btn-secundario" id="btn-edit-act">Editar</button>`
+      : "",
+    true
+  );
+
+  if (a.lleva_responsiva)
+    activarBotonesDocumento([...(a.asignado_a ? [a.asignado_a] : []), ...a.historial]);
+
+  if (puedeEditar()) {
+    $("#btn-edit-act").onclick = () => modalActivo(a, a.tipo, SECCIONES[seccion].tipos);
+    const bAsig = $("#btn-asig");
+    if (bAsig) bAsig.onclick = () => modalAsignar(a);
+    const bDev = $("#btn-dev");
+    if (bDev) bDev.onclick = () => modalDevolver(a.asignado_a.id);
+    const bDocs = $("#btn-docs");
+    if (bDocs) bDocs.onclick = () => modalDocumentos(a.asignado_a);
+    $("#btn-borrar-act").onclick = async () => {
+      const aviso = a.historial.length
+        ? `¿Eliminar ${a.codigo}? Se borrará también su historial de ${a.historial.length} asignación(es). No se puede deshacer.`
+        : `¿Eliminar ${a.codigo}? Esta acción no se puede deshacer.`;
+      if (await confirmar(aviso)) {
+        try {
+          await api(`/api/activos/${a.id}`, { method: "DELETE" });
+          cerrarModal();
+          toast("Registro eliminado");
+          irA(seccion);
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      }
+    };
+  }
+}
+
+function camposComputo(d, conMarca = true) {
+  return `
+      ${
+        conMarca
+          ? `<div class="campo"><label>Marca</label><input name="marca" value="${esc(d.marca || "")}"></div>
+             <div class="campo"><label>Modelo</label><input name="modelo" value="${esc(d.modelo || "")}"></div>`
+          : ""
+      }
+      <div class="campo"><label>Número de serie</label><input name="numero_serie" value="${esc(d.numero_serie || "")}" placeholder="Etiqueta del fabricante"></div>
+      <div class="campo"><label>Procesador</label><input name="procesador" value="${esc(d.procesador || "")}"></div>
+      <div class="campo"><label>RAM (GB)</label><input name="ram_gb" type="number" value="${d.ram_gb || ""}"></div>
+      <div class="campo"><label>Almacenamiento</label><input name="almacenamiento" value="${esc(d.almacenamiento || "")}" placeholder="512 GB SSD"></div>
+      <div class="campo"><label>Sistema operativo</label><input name="sistema_operativo" value="${esc(d.sistema_operativo || "")}"></div>`;
+}
+
+// Tope de licencias por familia según el plan
+const LICENCIAS_POR_FAMILIA = { LICENCIA_MICROSOFT: 6, LICENCIA_NORTON: 10 };
+
+function familiasDe(tipo) {
+  const patron = tipo === "LICENCIA_NORTON" ? /norton/i : /microsoft|365|office/i;
+  return estado.catalogos.cuentas_licencia.filter((c) => patron.test(c.producto || ""));
+}
+
+function opcionesFamilia(tipo, seleccionada = null) {
+  const tope = LICENCIAS_POR_FAMILIA[tipo] || 6;
+  return (
+    `<option value="">— Sin familia —</option>` +
+    familiasDe(tipo)
+      .map((c) => {
+        const cupo = Math.min(tope, c.ranuras_totales);
+        const propia = String(c.id) === String(seleccionada);
+        const llena = c.ranuras_usadas >= cupo && !propia;
+        return `<option value="${c.id}" ${propia ? "selected" : ""} ${llena ? "disabled" : ""}>
+          ${esc(c.nombre)} · ${c.ranuras_usadas}/${cupo}${llena ? " · llena" : ""}</option>`;
+      })
+      .join("")
+  );
+}
+
+function camposPorTipo(tipo, a) {
+  const d = { ...a?.movil, ...a?.computo, ...a?.correo, ...a?.licencia };
+  if (tipo === "COMPUTO" || tipo === "TABLETA") return camposComputo(d);
+
+  if (tipo === "TELEFONO")
+    return `
+      <div class="campo"><label>Marca</label><input name="marca" value="${esc(d.marca || "")}"></div>
+      <div class="campo"><label>Modelo</label><input name="modelo" value="${esc(d.modelo || "")}"></div>
+      <div class="campo"><label>IMEI</label><input name="imei" value="${esc(d.imei || "")}"></div>
+      <div class="campo"><label>Número telefónico</label><input name="numero_telefonico" value="${esc(d.numero_telefonico || "")}"></div>
+      <div class="campo"><label>ICCID</label><input name="iccid" value="${esc(d.iccid || "")}"></div>
+      <div class="campo"><label>Operador</label><input value="Telcel" disabled></div>
+      <div class="campo"><label>Plan</label>
+        <div class="entrada-moneda"><span>$</span><input name="precio_plan" type="number" min="0" step="0.01" value="${d.precio_plan ?? ""}" placeholder="0.00"></div></div>
+      <div class="campo"><label>Esquema</label><input value="Plazo Forzoso con Equipo" disabled></div>
+      <div class="campo check"><input type="checkbox" name="esim" id="chk-esim" ${d.esim ? "checked" : ""}><label for="chk-esim">Es eSIM</label></div>`;
+
+  if (tipo === "CORREO_WORKSPACE")
+    return `
+      <div class="campo"><label>Dirección *</label><input name="direccion" required value="${esc(d.direccion || "")}"></div>
+      <div class="campo"><label>Estatus</label>${interruptor("habilitada", d.habilitada !== false)}</div>
+      <div class="campo"><label>Almacenamiento (GB)</label><input name="almacenamiento_gb" type="number" step="0.01" value="${d.almacenamiento_gb ?? ""}"></div>`;
+
+  return `
+    <div class="campo"><label>Familia</label>
+      <select name="cuenta_id">${opcionesFamilia(tipo, d.cuenta_id)}</select></div>
+    <div class="campo"><label>Correo de la licencia</label><input name="correo_licencia" value="${esc(d.correo_licencia || "")}"></div>
+    <div class="campo"><label>Identificador del dispositivo</label>
+      <input name="identificador_dispositivo" value="${esc(d.identificador_dispositivo || "")}" placeholder="TOL-FIN-1"></div>`;
+}
+
+function armarActivo(plano, tipo) {
+  const soloDe = (campos) =>
+    Object.fromEntries(campos.filter((k) => k in plano).map((k) => [k, plano[k]]));
+
+  const base = {
+    tipo,
+    codigo: plano.codigo,
+    estatus: plano.estatus,
+    descripcion: plano.descripcion,
+    fecha_adquisicion: plano.fecha_adquisicion,
+    fecha_vencimiento: plano.fecha_vencimiento,
+    notas: plano.notas,
+  };
+
+  const deComputo = ["marca", "modelo", "numero_serie", "procesador", "ram_gb",
+    "almacenamiento", "sistema_operativo", "clave_windows"];
+  const deMovil = ["marca", "modelo", "imei", "numero_telefonico", "iccid",
+    "precio_plan", "esim", "cuenta_operador"];
+
+  if (tipo === "COMPUTO" || tipo === "TABLETA") base.computo = soloDe(deComputo);
+  if (tipo === "TELEFONO") base.movil = soloDe(deMovil);
+  if (tipo === "CORREO_WORKSPACE")
+    base.correo = soloDe(["direccion", "habilitada", "almacenamiento_gb", "alias_de"]);
+  if (tipo === "LICENCIA_MICROSOFT" || tipo === "LICENCIA_NORTON")
+    base.licencia = soloDe(["cuenta_id", "correo_licencia", "identificador_dispositivo"]);
+
+  return base;
+}
+
+function modalActivo(a = null, tipoInicial = "COMPUTO", tiposPermitidos = null, inicial = null) {
+  const c = estado.catalogos;
+  const tipo = a?.tipo || tipoInicial;
+  void c;
+  const lista = tiposPermitidos || Object.keys(TIPOS);
+
+  abrirModal(
+    a ? `Editar ${a.codigo}` : "Nuevo registro",
+    `<form id="form-act">
+      <div class="rejilla">
+        ${
+          lista.length > 1
+            ? `<div class="campo"><label>Tipo *</label>
+                 <select name="tipo" id="sel-tipo" ${a ? "disabled" : ""}>${opciones(lista, tipo, "")}</select></div>`
+            : `<input type="hidden" name="tipo" id="sel-tipo" value="${tipo}">`
+        }
+        <div class="campo"><label>Código</label>
+          <input name="codigo" value="${esc(a?.codigo || "")}" placeholder="Se genera solo"></div>
+        <div class="campo"><label>Estatus</label>
+          <select name="estatus">${opciones(c.estatus_activo, a?.estatus || "DISPONIBLE", "")}</select></div>
+        <div class="campo"><label>Descripción</label><input name="descripcion" value="${esc(a?.descripcion || "")}"></div>
+        ${
+          LICENCIAS.includes(tipo)
+            ? ""
+            : `<div class="campo"><label>Fecha de adquisición</label><input name="fecha_adquisicion" type="date" value="${a?.fecha_adquisicion || ""}"></div>`
+        }
+        ${
+          SIN_VENCIMIENTO.includes(tipo)
+            ? ""
+            : `<div class="campo"><label>Vencimiento / renovación</label><input name="fecha_vencimiento" type="date" value="${a?.fecha_vencimiento || ""}"></div>`
+        }
+      </div>
+      <h3 style="font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--texto-tenue);margin:14px 0 10px">
+        Datos específicos</h3>
+      <div class="rejilla" id="campos-tipo">${camposPorTipo(tipo, a || inicial)}</div>
+      <div class="campo"><label>Notas</label><textarea name="notas" rows="2">${esc(a?.notas || "")}</textarea></div>
+    </form>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Guardar</button>`
+  );
+
+  const sel = $("#sel-tipo");
+  if (sel && sel.tagName === "SELECT") {
+    sel.onchange = (e) => ($("#campos-tipo").innerHTML = camposPorTipo(e.target.value, null));
+  }
+  $("#cancelar").onclick = cerrarModal;
+  $("#guardar").onclick = async () => {
+    const form = $("#form-act");
+    if (!form.reportValidity()) return;
+    const plano = recolectar(form);
+    try {
+      await api(a ? `/api/activos/${a.id}` : "/api/activos", {
+        method: a ? "PUT" : "POST",
+        body: JSON.stringify(armarActivo(plano, a?.tipo || plano.tipo)),
+      });
+      cerrarModal();
+      toast(a ? "Registro actualizado" : "Registro creado");
+      await recargarCatalogos();
+      irA(estado.vista);
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
+// ---------------------------------------------------------------- alta combinada de equipo
+
+async function modalAltaEquipo(tipo = "COMPUTO") {
+  const c = estado.catalogos;
+  const tablet = tipo === "TABLETA";
+  const empleados = await api("/api/empleados?estatus=ACTIVO");
+  const hoy = hoyISO();
+
+  abrirModal(
+    tablet ? "Nueva tablet" : "Nuevo equipo de cómputo",
+    `<form id="form-alta">
+      <div class="rejilla">
+        <div class="campo"><label>Código</label><input name="codigo" placeholder="Se genera solo"></div>
+        <div class="campo"><label>Descripción</label><input name="descripcion" placeholder="${tablet ? "Samsung Galaxy Tab A9+" : "HP ProBook 445 G10"}"></div>
+        <div class="campo"><label>Fecha de adquisición</label><input name="fecha_adquisicion" type="date"></div>
+        <div class="campo"><label>Marca</label><input name="marca"></div>
+        <div class="campo"><label>Modelo</label><input name="modelo"></div>
+        <div class="campo"><label>Número de serie</label><input name="numero_serie" placeholder="Etiqueta del fabricante"></div>
+        <div class="campo"><label>Procesador</label><input name="procesador"></div>
+        <div class="campo"><label>RAM (GB)</label><input name="ram_gb" type="number"></div>
+        <div class="campo"><label>Almacenamiento</label><input name="almacenamiento" placeholder="${tablet ? "128 GB" : "512 GB SSD"}"></div>
+        <div class="campo"><label>Sistema operativo</label><input name="sistema_operativo"></div>
+      </div>
+
+      <details class="bloque">
+        <summary>Cuenta de correo (opcional)</summary>
+        <div class="contenido-bloque"><div class="rejilla">
+          <div class="campo"><label>Dirección</label><input name="correo_direccion" type="email" placeholder="usuario@empresa.com"></div>
+          <div class="campo"><label>Estatus</label>${interruptor("correo_habilitada", true)}</div>
+        </div></div>
+      </details>
+
+      <details class="bloque">
+        <summary>Licencia Microsoft 365 (opcional)</summary>
+        <div class="contenido-bloque"><div class="rejilla">
+          <div class="campo"><label>Cuenta</label>
+            <select name="ms_cuenta_id">${opcionesFamilia("LICENCIA_MICROSOFT")}</select></div>
+          <div class="campo"><label>Correo de la licencia</label><input name="ms_correo"></div>
+          <div class="campo"><label>Identificador</label><input name="ms_identificador"></div>
+        </div></div>
+      </details>
+
+      <details class="bloque">
+        <summary>Licencia Norton 360 (opcional)</summary>
+        <div class="contenido-bloque"><div class="rejilla">
+          <div class="campo"><label>Cuenta</label>
+            <select name="nor_cuenta_id">${opcionesFamilia("LICENCIA_NORTON")}</select></div>
+          <div class="campo"><label>Correo de la licencia</label><input name="nor_correo"></div>
+          <div class="campo"><label>Identificador</label><input name="nor_identificador" placeholder="TOL-FIN-1"></div>
+        </div></div>
+      </details>
+
+      <details class="bloque" open>
+        <summary>Asignación y documentos (opcional)</summary>
+        <div class="contenido-bloque">
+          <div class="rejilla">
+            <div class="campo"><label>Asignar a</label>
+              <select name="empleado_id">${opciones(
+                empleados.map((e) => ({ id: e.id, nombre: `${e.nombre_completo} (${e.codigo})` })),
+                "",
+                "— No asignar por ahora —"
+              )}</select></div>
+            <div class="campo"><label>Fecha de asignación</label>
+              <input name="fecha_asignacion" type="date" value="${hoy}"></div>
+          </div>
+          <h3 style="font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--texto-tenue);margin:14px 0 10px">Responsiva</h3>
+          ${camposDocumento("responsiva")}
+        </div>
+      </details>
+
+      <div class="campo"><label>Notas</label><textarea name="notas" rows="2"></textarea></div>
+    </form>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Guardar</button>`,
+    true
+  );
+
+  activarSubida("responsiva");
+  activarEstadoDocumento();
+  $("#cancelar").onclick = cerrarModal;
+
+  $("#guardar").onclick = async () => {
+    const form = $("#form-alta");
+    if (!form.reportValidity()) return;
+    const p = recolectar(form);
+
+    const cuerpo = {
+      equipo: {
+        tipo,
+        codigo: p.codigo,
+        estatus: "DISPONIBLE",
+        descripcion: p.descripcion,
+        fecha_adquisicion: p.fecha_adquisicion,
+        notas: p.notas,
+        computo: {
+          marca: p.marca, modelo: p.modelo, numero_serie: p.numero_serie,
+          procesador: p.procesador, ram_gb: p.ram_gb, almacenamiento: p.almacenamiento,
+          sistema_operativo: p.sistema_operativo,
+        },
+      },
+      empleado_id: p.empleado_id || null,
+      fecha_asignacion: p.fecha_asignacion,
+      responsiva_estado: p.responsiva_estado,
+      responsiva_fecha_envio: p.responsiva_fecha_envio,
+      responsiva_fecha_firma: p.responsiva_fecha_firma,
+      responsiva_destino: p.responsiva_destino,
+      responsiva_archivo: p.responsiva_archivo,
+      responsiva_nombre: p.responsiva_nombre,
+      responsiva_url: p.responsiva_url,
+    };
+
+    if (p.correo_direccion)
+      cuerpo.correo = {
+        direccion: p.correo_direccion,
+        habilitada: p.correo_habilitada,
+      };
+    if (p.ms_cuenta_id || p.ms_correo || p.ms_identificador)
+      cuerpo.licencia_microsoft = {
+        cuenta_id: p.ms_cuenta_id,
+        correo_licencia: p.ms_correo,
+        identificador_dispositivo: p.ms_identificador,
+      };
+    if (p.nor_cuenta_id || p.nor_correo || p.nor_identificador)
+      cuerpo.licencia_norton = {
+        cuenta_id: p.nor_cuenta_id,
+        correo_licencia: p.nor_correo,
+        identificador_dispositivo: p.nor_identificador,
+      };
+
+    try {
+      const r = await api("/api/altas/equipo", {
+        method: "POST",
+        body: JSON.stringify(cuerpo),
+      });
+      cerrarModal();
+      toast(
+        `${r.creados.length} registro(s) creado(s)` +
+          (r.asignados ? ` y asignado(s)` : "")
+      );
+      await recargarCatalogos();
+      await refrescarContadorAlertas();
+      irA(tablet ? "tabletas" : "equipos");
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
+// ---------------------------------------------------------------- asignaciones y documentos
+
+function tipoLlevaResponsiva(tipo) {
+  return LLEVAN_RESPONSIVA.includes(tipo);
+}
+
+async function modalAsignar(activo = null, empleado = null) {
+  const [activos, empleados] = await Promise.all([
+    activo ? Promise.resolve([activo]) : api("/api/activos?sin_asignar=true"),
+    empleado ? Promise.resolve([empleado]) : api("/api/empleados?estatus=ACTIVO"),
+  ]);
+
+  if (!activos.length) {
+    toast("No hay activos libres para asignar", "error");
+    return;
+  }
+
+  abrirModal(
+    "Asignar activo",
+    `<form id="form-asig">
+      <div class="campo"><label>Activo *</label>
+        <select name="activo_id" required ${activo ? "disabled" : ""}>
+          ${activos
+            .map(
+              (a) =>
+                `<option value="${a.id}">${esc(a.codigo)} — ${esc(TIPOS[a.tipo] || a.tipo)}${
+                  a.descripcion ? " — " + esc(a.descripcion) : ""
+                }</option>`
+            )
+            .join("")}
+        </select></div>
+      <div class="campo"><label>Empleado *</label>
+        <select name="empleado_id" required ${empleado ? "disabled" : ""}>
+          ${empleados
+            .map(
+              (e) => `<option value="${e.id}">${esc(e.nombre_completo)} (${esc(e.codigo)})</option>`
+            )
+            .join("")}
+        </select></div>
+      <div class="campo"><label>Fecha de asignación</label>
+        <input name="fecha_asignacion" type="date" value="${hoyISO()}"></div>
+
+      <div id="bloque-responsiva">
+        <h3 style="font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--texto-tenue);margin:16px 0 10px">Responsiva</h3>
+        ${camposDocumento("responsiva")}
+      </div>
+
+      <div id="bloque-ine">
+        <h3 style="font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--texto-tenue);margin:18px 0 10px">INE</h3>
+        ${camposDocumento("ine")}
+      </div>
+
+      <div class="campo"><label>Notas</label><textarea name="notas" rows="2"></textarea></div>
+    </form>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Asignar</button>`,
+    true
+  );
+
+  activarSubida("responsiva");
+  activarSubida("ine");
+  activarEstadoDocumento();
+
+  const selActivo = $('#form-asig [name="activo_id"]');
+  const mostrarDocumentos = () => {
+    const tipo = activos.find((x) => String(x.id) === selActivo.value)?.tipo;
+    $("#bloque-responsiva").hidden = !tipoLlevaResponsiva(tipo);
+    $("#bloque-ine").hidden = !LLEVAN_INE.includes(tipo);
+  };
+  selActivo.onchange = mostrarDocumentos;
+  mostrarDocumentos();
+
+  $("#cancelar").onclick = cerrarModal;
+  $("#guardar").onclick = async () => {
+    const form = $("#form-asig");
+    if (!form.reportValidity()) return;
+    const datos = recolectar(form);
+    datos.activo_id = Number(activo ? activo.id : datos.activo_id);
+    datos.empleado_id = Number(empleado ? empleado.id : datos.empleado_id);
+    try {
+      await api("/api/asignaciones", { method: "POST", body: JSON.stringify(datos) });
+      cerrarModal();
+      toast("Activo asignado");
+      await refrescarContadorAlertas();
+      irA(estado.vista);
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
+function modalDocumentos(asignacion, conIne = true) {
+  const ine = conIne && LLEVAN_INE.includes(asignacion.activo_tipo);
+  abrirModal(
+    `Documentos de ${asignacion.activo_codigo}`,
+    `<form id="form-docs">
+      <h3 style="font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--texto-tenue);margin:0 0 10px">Responsiva</h3>
+      ${camposDocumento("responsiva", asignacion)}
+
+      ${
+        ine
+          ? `<h3 style="font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--texto-tenue);margin:18px 0 10px">INE</h3>
+             ${camposDocumento("ine", asignacion)}`
+          : ""
+      }
+
+      <div class="campo"><label>Notas</label><textarea name="notas" rows="2">${esc(asignacion.notas || "")}</textarea></div>
+    </form>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Guardar</button>`,
+    true
+  );
+
+  activarSubida("responsiva");
+  activarSubida("ine");
+  activarEstadoDocumento();
+  $("#cancelar").onclick = cerrarModal;
+  $("#guardar").onclick = async () => {
+    const datos = recolectar($("#form-docs"));
+    // Si no se subió archivo nuevo, se conserva el que ya estaba
+    datos.responsiva_archivo = datos.responsiva_archivo || asignacion.responsiva_archivo;
+    datos.responsiva_nombre = datos.responsiva_nombre || asignacion.responsiva_nombre;
+    datos.ine_archivo = datos.ine_archivo || asignacion.ine_archivo;
+    datos.ine_nombre = datos.ine_nombre || asignacion.ine_nombre;
+    if (!ine) {
+      datos.ine_estado = asignacion.ine_estado;
+      datos.ine_url = asignacion.ine_url;
+    }
+    try {
+      await api(`/api/asignaciones/${asignacion.id}`, {
+        method: "PUT",
+        body: JSON.stringify(datos),
+      });
+      cerrarModal();
+      toast("Documentos actualizados");
+      await refrescarContadorAlertas();
+      irA(estado.vista);
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
+function modalDevolver(asignacionId) {
+  abrirModal(
+    "Registrar devolución",
+    `<form id="form-dev">
+      <div class="rejilla">
+        <div class="campo"><label>Fecha de devolución</label>
+          <input name="fecha_devolucion" type="date" value="${hoyISO()}"></div>
+        <div class="campo"><label>Nuevo estatus del activo</label>
+          <select name="nuevo_estatus_activo">${opciones(
+            estado.catalogos.estatus_activo.filter((e) => e !== "ASIGNADO"),
+            "DISPONIBLE",
+            ""
+          )}</select></div>
+      </div>
+      <div class="campo"><label>Motivo</label>
+        <input name="motivo_devolucion" placeholder="Baja del empleado, cambio de equipo, robo…"></div>
+      <div class="campo"><label>Notas</label><textarea name="notas" rows="2"></textarea></div>
+    </form>`,
+    `<button class="btn-secundario" id="cancelar">Cancelar</button>
+     <button class="btn-primario" id="guardar">Registrar</button>`
+  );
+
+  $("#cancelar").onclick = cerrarModal;
+  $("#guardar").onclick = async () => {
+    try {
+      await api(`/api/asignaciones/${asignacionId}/devolver`, {
+        method: "POST",
+        body: JSON.stringify(recolectar($("#form-dev"))),
+      });
+      cerrarModal();
+      toast("Devolución registrada");
+      await refrescarContadorAlertas();
+      irA(estado.vista);
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+}
+
