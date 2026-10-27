@@ -2024,3 +2024,497 @@ def devolver(
     return dic_asignacion(asignacion)
 
 
+# --------------------------------------------------------------------------
+# Tablero y alertas
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/tablero")
+def tablero(db: Session = Depends(obtener_sesion), _=Depends(usuario_actual)):
+    por_tipo = dict(db.query(Activo.tipo, func.count(Activo.id)).group_by(Activo.tipo).all())
+    fisico = Activo.tipo.in_(TIPOS_FISICOS)
+    por_estatus = dict(
+        db.query(Activo.estatus, func.count(Activo.id))
+        .filter(fisico)
+        .group_by(Activo.estatus)
+        .all()
+    )
+    asignados = (
+        db.query(func.count(Asignacion.id))
+        .join(Activo, Activo.id == Asignacion.activo_id)
+        .filter(Asignacion.fecha_devolucion.is_(None), fisico)
+        .scalar()
+    )
+    def contar_documento(estado):
+        return (
+            db.query(func.count(Asignacion.id))
+            .filter(
+                Asignacion.fecha_devolucion.is_(None),
+                Asignacion.responsiva_estado == estado,
+            )
+            .scalar()
+        )
+
+    return {
+        "empleados_activos": db.query(func.count(Empleado.id))
+        .filter(Empleado.estatus == EstatusEmpleado.ACTIVO)
+        .scalar(),
+        "empleados_baja": db.query(func.count(Empleado.id))
+        .filter(Empleado.estatus == EstatusEmpleado.BAJA)
+        .scalar(),
+        "total_activos": db.query(func.count(Activo.id)).filter(fisico).scalar(),
+        "activos_asignados": asignados,
+        "activos_disponibles": db.query(func.count(Activo.id))
+        .filter(fisico, Activo.estatus == EstatusActivo.DISPONIBLE)
+        .scalar(),
+        "total_servicios": db.query(func.count(Activo.id)).filter(~fisico).scalar(),
+        "responsivas_pendientes": contar_documento(EstadoDocumento.PENDIENTE),
+        "responsivas_en_espera": contar_documento(EstadoDocumento.ENVIADA),
+        "responsivas_firmadas": contar_documento(EstadoDocumento.FIRMADA),
+        "notas_abiertas": db.query(func.count(Nota.id))
+        .filter(Nota.estado != EstadoNota.RESUELTA)
+        .scalar(),
+        "por_tipo": {t.value: n for t, n in por_tipo.items()},
+        "por_estatus": {e.value: n for e, n in por_estatus.items()},
+        "por_departamento": activos_por_departamento(db),
+        "vencimientos_licencias": vencimientos_licencias(db),
+    }
+
+
+def activos_por_departamento(db: Session) -> list[dict]:
+    """Activos físicos vigentes según el departamento de quien los tiene."""
+    filas = (
+        db.query(Departamento.nombre, func.count(Asignacion.id))
+        .select_from(Asignacion)
+        .join(Activo, Activo.id == Asignacion.activo_id)
+        .join(Empleado, Empleado.id == Asignacion.empleado_id)
+        .outerjoin(Departamento, Departamento.id == Empleado.departamento_id)
+        .filter(Asignacion.fecha_devolucion.is_(None), Activo.tipo.in_(TIPOS_FISICOS))
+        .group_by(Departamento.nombre)
+        .all()
+    )
+    salida = [{"departamento": nombre or "SIN DEPARTAMENTO", "activos": n} for nombre, n in filas]
+    return sorted(salida, key=lambda f: -f["activos"])
+
+
+def vencimientos_licencias(db: Session) -> list[dict]:
+    """Renovación de cada familia de Microsoft 365 y Norton, y de licencias sueltas con fecha."""
+    hoy = hoy_local()
+    salida = []
+    for c in db.query(CuentaLicencia).filter(CuentaLicencia.activo.is_(True)):
+        tipos = {d.activo.tipo for d in c.licencias}
+        producto = (
+            "NORTON"
+            if TipoActivo.LICENCIA_NORTON in tipos or "norton" in (c.producto or "").lower()
+            else "MICROSOFT"
+        )
+        salida.append(
+            {
+                "producto": producto,
+                "nombre": c.nombre,
+                "correo": c.correo_cuenta,
+                "fecha": c.fecha_renovacion,
+                "dias": (c.fecha_renovacion - hoy).days if c.fecha_renovacion else None,
+                "licencias": len(c.licencias),
+                "cuenta_id": c.id,
+            }
+        )
+    for a in (
+        db.query(Activo)
+        .join(DetalleLicencia)
+        .filter(DetalleLicencia.cuenta_id.is_(None), Activo.fecha_vencimiento.isnot(None))
+    ):
+        salida.append(
+            {
+                "producto": "NORTON" if a.tipo == TipoActivo.LICENCIA_NORTON else "MICROSOFT",
+                "nombre": a.codigo,
+                "correo": a.detalle_licencia.correo_licencia or a.detalle_licencia.identificador_dispositivo,
+                "fecha": a.fecha_vencimiento,
+                "dias": (a.fecha_vencimiento - hoy).days,
+                "licencias": 1,
+                "activo_id": a.id,
+            }
+        )
+    return sorted(salida, key=lambda v: (v["fecha"] is None, v["fecha"] or hoy))
+
+
+@app.get("/api/notificaciones")
+def notificaciones(db: Session = Depends(obtener_sesion), _=Depends(usuario_actual)):
+    """Responsivas que todavía no regresan firmadas, de la más antigua a la más reciente."""
+    pendientes = (
+        db.query(Asignacion)
+        .filter(
+            Asignacion.fecha_devolucion.is_(None),
+            Asignacion.responsiva_estado.in_(
+                [EstadoDocumento.PENDIENTE, EstadoDocumento.ENVIADA]
+            ),
+        )
+        .order_by(Asignacion.fecha_asignacion)
+        .all()
+    )
+    salida = []
+    for a in pendientes:
+        datos = dic_asignacion(a)
+        datos["atrasada"] = bool(
+            datos["dias_en_espera"] is not None
+            and datos["dias_en_espera"] > DIAS_ESPERA_RESPONSIVA
+        )
+        salida.append(datos)
+    return salida
+
+
+@app.get("/api/alertas")
+def alertas(
+    dias: int = Query(60, ge=1, le=365),
+    db: Session = Depends(obtener_sesion),
+    _=Depends(usuario_actual),
+):
+    hoy = hoy_local()
+    resultado: list[dict] = []
+
+    # Licencias: una alerta por familia (o por licencia suelta) a 60 días o menos
+    for v in vencimientos_licencias(db):
+        if v["dias"] is None or v["dias"] > dias:
+            continue
+        producto = "Norton 360" if v["producto"] == "NORTON" else "Microsoft 365"
+        if v["dias"] < 0:
+            cuando = f"venció hace {-v['dias']} día(s)"
+        elif v["dias"] == 0:
+            cuando = "vence hoy"
+        else:
+            cuando = f"vence en {v['dias']} día(s)"
+        resultado.append(
+            {
+                "severidad": "critica" if v["dias"] <= 30 else "media",
+                "tipo": "licencia_por_vencer",
+                "titulo": f"{v['nombre']} ({producto}) {cuando}",
+                "detalle": f"Renovación el {v['fecha']:%d/%m/%Y} · {v['licencias']} licencia(s)"
+                + (f" · {v['correo']}" if v["correo"] else ""),
+                "dias": v["dias"],
+                "producto": v["producto"].lower(),
+                "cuenta_id": v.get("cuenta_id"),
+                "activo_id": v.get("activo_id"),
+            }
+        )
+
+    for c in db.query(CuentaLicencia).filter_by(activo=True).all():
+        usadas = db.query(DetalleLicencia).filter_by(cuenta_id=c.id).count()
+        if usadas > c.ranuras_totales:
+            resultado.append(
+                {
+                    "severidad": "critica",
+                    "tipo": "sobreasignacion",
+                    "titulo": f"{c.nombre} tiene {usadas} usos sobre {c.ranuras_totales} ranuras",
+                    "detalle": "Se están usando más licencias de las contratadas",
+                    "cuenta_id": c.id,
+                    "producto": "norton" if "norton" in (c.producto or "").lower() else "microsoft",
+                }
+            )
+
+    for d in (
+        db.query(DetalleCorreo)
+        .join(Activo, Activo.id == DetalleCorreo.activo_id)
+        .filter(Activo.estatus != EstatusActivo.BAJA)
+        .order_by(DetalleCorreo.ultimo_acceso)
+    ):
+        if not correo_en_desuso(d):
+            continue
+        vig = asignacion_vigente(db, d.activo_id)
+        partes = [
+            f"Último acceso {d.ultimo_acceso:%d/%m/%Y}" if d.ultimo_acceso else "Sin accesos registrados",
+            f"{float(d.almacenamiento_gb):.2f} GB" if d.almacenamiento_gb is not None else None,
+            vig.empleado.nombre_completo if vig else "Sin asignar",
+        ]
+        resultado.append(
+            {
+                "severidad": "media",
+                "tipo": "correo_sin_uso",
+                "titulo": f"{d.direccion} nunca ha iniciado sesión"
+                if d.ultimo_acceso is None
+                else f"{d.direccion} lleva {dias_sin_acceso(d)} días sin iniciar sesión",
+                "detalle": " · ".join(p for p in partes if p),
+                "activo_id": d.activo_id,
+            }
+        )
+
+    baja_con_activos = (
+        db.query(Empleado)
+        .join(Asignacion, Asignacion.empleado_id == Empleado.id)
+        .filter(Empleado.estatus == EstatusEmpleado.BAJA, Asignacion.fecha_devolucion.is_(None))
+        .distinct()
+        .all()
+    )
+    for e in baja_con_activos:
+        pendientes = (
+            db.query(func.count(Asignacion.id))
+            .filter(Asignacion.empleado_id == e.id, Asignacion.fecha_devolucion.is_(None))
+            .scalar()
+        )
+        resultado.append(
+            {
+                "severidad": "critica",
+                "tipo": "baja_con_activos",
+                "titulo": f"{e.nombre_completo} está dado de baja y conserva {pendientes} activo(s)",
+                "detalle": "Registrar la devolución de los equipos",
+                "empleado_id": e.id,
+            }
+        )
+
+    pendientes = (
+        db.query(func.count(Asignacion.id))
+        .filter(
+            Asignacion.fecha_devolucion.is_(None),
+            Asignacion.responsiva_estado == EstadoDocumento.PENDIENTE,
+        )
+        .scalar()
+    )
+    if pendientes:
+        resultado.append(
+            {
+                "severidad": "media",
+                "tipo": "responsiva",
+                "titulo": f"{pendientes} activo(s) entregados sin responsiva",
+                "detalle": "Todavía no se envían a firmar",
+            }
+        )
+
+    # Responsivas que llevan demasiado tiempo fuera esperando firma
+    atrasadas = (
+        db.query(Asignacion)
+        .filter(
+            Asignacion.fecha_devolucion.is_(None),
+            Asignacion.responsiva_estado == EstadoDocumento.ENVIADA,
+            Asignacion.responsiva_fecha_envio.isnot(None),
+            Asignacion.responsiva_fecha_envio <= hoy - dt.timedelta(days=DIAS_ESPERA_RESPONSIVA),
+        )
+        .all()
+    )
+    for a in atrasadas:
+        dias = (hoy - a.responsiva_fecha_envio).days
+        resultado.append(
+            {
+                "severidad": "media",
+                "tipo": "responsiva_atrasada",
+                "titulo": f"Responsiva de {a.activo.codigo} lleva {dias} días esperando firma",
+                "detalle": a.empleado.nombre_completo
+                + (f" · enviada a {a.responsiva_destino}" if a.responsiva_destino else ""),
+                "activo_id": a.activo_id,
+                "asignacion_id": a.id,
+            }
+        )
+
+    # Auditorias semanales sin cerrar
+    for aud in (
+        db.query(Auditoria)
+        .filter(Auditoria.estado == EstadoAuditoria.EN_PROCESO, Auditoria.fecha_fin < hoy)
+        .all()
+    ):
+        abiertos = (
+            db.query(func.count(ItemAuditoria.id))
+            .filter(
+                ItemAuditoria.auditoria_id == aud.id,
+                ItemAuditoria.estado == EstadoItem.PENDIENTE,
+            )
+            .scalar()
+        )
+        resultado.append(
+            {
+                "severidad": "media",
+                "tipo": "auditoria",
+                "titulo": f"Auditoría de {aud.tipo.value.lower()} de la semana del "
+                f"{aud.fecha_inicio:%d/%m} sigue abierta",
+                "detalle": f"{abiertos} punto(s) sin revisar"
+                + (f" · {aud.analista_nombre}" if aud.analista_nombre else ""),
+                "auditoria_id": aud.id,
+            }
+        )
+
+    corte = hoy - dt.timedelta(days=4 * 365)
+    viejos = (
+        db.query(func.count(Activo.id))
+        .filter(
+            Activo.tipo == TipoActivo.COMPUTO,
+            Activo.fecha_adquisicion.isnot(None),
+            Activo.fecha_adquisicion <= corte,
+            Activo.estatus != EstatusActivo.BAJA,
+        )
+        .scalar()
+    )
+    if viejos:
+        resultado.append(
+            {
+                "severidad": "baja",
+                "tipo": "reemplazo",
+                "titulo": f"{viejos} equipo(s) de cómputo superan 4 años de antigüedad",
+                "detalle": "Candidatos a reemplazo",
+            }
+        )
+
+    orden = {"critica": 0, "media": 1, "baja": 2}
+    resultado.sort(key=lambda a: orden.get(a["severidad"], 9))
+    return resultado
+
+
+# --------------------------------------------------------------------------
+# Reportes
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/reportes/inventario")
+def reporte_inventario(
+    agrupar_por: str = Query("sucursal", pattern="^(sucursal|departamento|tipo|estatus)$"),
+    db: Session = Depends(obtener_sesion),
+    _=Depends(usuario_actual),
+):
+    fisico = Activo.tipo.in_(TIPOS_FISICOS)
+    if agrupar_por == "tipo":
+        datos = (
+            db.query(Activo.tipo, func.count(Activo.id)).filter(fisico).group_by(Activo.tipo).all()
+        )
+        filas = [{"grupo": t.value, "activos": n} for t, n in datos]
+
+    elif agrupar_por == "estatus":
+        datos = (
+            db.query(Activo.estatus, func.count(Activo.id))
+            .filter(fisico)
+            .group_by(Activo.estatus)
+            .all()
+        )
+        filas = [{"grupo": e.value, "activos": n} for e, n in datos]
+
+    else:
+        # La ubicación es de la persona: el activo se cuenta donde está quien lo tiene
+        Catalogo, campo = (
+            (Sucursal, Empleado.sucursal_id)
+            if agrupar_por == "sucursal"
+            else (Departamento, Empleado.departamento_id)
+        )
+        datos = (
+            db.query(Catalogo.nombre, func.count(Asignacion.id))
+            .select_from(Catalogo)
+            .join(Empleado, campo == Catalogo.id)
+            .join(
+                Asignacion,
+                (Asignacion.empleado_id == Empleado.id)
+                & (Asignacion.fecha_devolucion.is_(None)),
+            )
+            .join(Activo, (Activo.id == Asignacion.activo_id) & fisico)
+            .group_by(Catalogo.nombre)
+            .all()
+        )
+        filas = [{"grupo": nombre, "activos": n} for nombre, n in datos]
+
+    filas = [f for f in filas if f["activos"]]
+    filas.sort(key=lambda f: -f["activos"])
+    return filas
+
+
+@app.get("/api/reportes/exportar")
+def exportar_excel(db: Session = Depends(obtener_sesion), _=Depends(usuario_actual)):
+    from openpyxl import Workbook
+
+    wb = Workbook()
+
+    hoja = wb.active
+    hoja.title = "Activos"
+    hoja.append(
+        [
+            "Código", "Tipo", "Estatus", "Descripción", "Serie/IMEI/Correo",
+            "Familia de licencia", "Asignado a", "Código empleado", "Departamento",
+            "Sucursal", "Locación", "Fecha adquisición", "Vencimiento", "Responsiva",
+        ]
+    )
+    for a in db.query(Activo).order_by(Activo.tipo, Activo.codigo).all():
+        vig = asignacion_vigente(db, a.id)
+        identificador = ""
+        if a.detalle_computo:
+            identificador = a.detalle_computo.numero_serie or ""
+        elif a.detalle_movil:
+            identificador = a.detalle_movil.imei or a.detalle_movil.numero_telefonico or ""
+        elif a.detalle_correo:
+            identificador = a.detalle_correo.direccion
+        elif a.detalle_licencia:
+            identificador = a.detalle_licencia.correo_licencia or ""
+
+        empleado = vig.empleado if vig else None
+        hoja.append(
+            [
+                a.codigo, a.tipo.value, a.estatus.value, a.descripcion, identificador,
+                a.detalle_licencia.cuenta.nombre
+                if a.detalle_licencia and a.detalle_licencia.cuenta
+                else "",
+                empleado.nombre_completo if empleado else "",
+                empleado.codigo if empleado else "",
+                empleado.departamento.nombre if empleado and empleado.departamento else "",
+                empleado.sucursal.nombre if empleado and empleado.sucursal else "",
+                lugar_trabajo(empleado) if empleado else "",
+                a.fecha_adquisicion, a.fecha_vencimiento,
+                vig.responsiva_estado.value if vig else "",
+            ]
+        )
+
+    hoja2 = wb.create_sheet("Empleados")
+    hoja2.append(
+        ["Código", "Nombre completo", "Correos asignados", "Puesto", "Sucursal",
+         "Departamento", "Locación", "Estatus", "Activos vigentes"]
+    )
+    todos = db.query(Empleado).order_by(Empleado.nombre_completo).all()
+    correos = correos_asignados(db, [e.id for e in todos])
+    for e in todos:
+        total = (
+            db.query(func.count(Asignacion.id))
+            .join(Activo, Activo.id == Asignacion.activo_id)
+            .filter(
+                Asignacion.empleado_id == e.id,
+                Asignacion.fecha_devolucion.is_(None),
+                Activo.tipo.in_(TIPOS_FISICOS),
+            )
+            .scalar()
+        )
+        hoja2.append(
+            [
+                e.codigo, e.nombre_completo, ", ".join(correos.get(e.id, [])), e.puesto,
+                e.sucursal.nombre if e.sucursal else "",
+                e.departamento.nombre if e.departamento else "",
+                lugar_trabajo(e),
+                e.estatus.value, total,
+            ]
+        )
+
+    hoja3 = wb.create_sheet("Historial")
+    hoja3.append(["Activo", "Tipo", "Empleado", "Desde", "Hasta", "Motivo", "Responsiva"])
+    for a in db.query(Asignacion).order_by(Asignacion.fecha_asignacion.desc()).all():
+        hoja3.append(
+            [
+                a.activo.codigo, a.activo.tipo.value, a.empleado.nombre_completo,
+                a.fecha_asignacion, a.fecha_devolucion, a.motivo_devolucion,
+                a.responsiva_estado.value,
+            ]
+        )
+
+    hoja4 = wb.create_sheet("Impresoras")
+    hoja4.append(
+        ["Número de serie", "Propietario", "Locación", "Departamentos",
+         "Número de serie del proveedor", "Identificador del proveedor"]
+    )
+    for i in db.query(Impresora).order_by(Impresora.numero_serie).all():
+        hoja4.append(
+            [
+                i.numero_serie, i.propietario.value, i.locacion,
+                ", ".join(d.nombre for d in i.departamentos),
+                i.numero_serie_proveedor, i.identificador_proveedor,
+            ]
+        )
+
+    _neutralizar_formulas(wb)
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    nombre = f"inventario_ti_{hoy_local():%Y%m%d}.xlsx"
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{nombre}"'},
+    )
+
+
