@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="es" data-tema="claro">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Panel de control TI</title>
+  <link rel="icon" href="/img/logo.png">
+  <script>
+    try {
+      var t = localStorage.getItem("tema");
+      if (t) document.documentElement.dataset.tema = t;
+      if (localStorage.getItem("menu-compacto") === "1") document.documentElement.classList.add("menu-compacto");
+    } catch (e) {}
+  </script>
+  <link rel="stylesheet" href="/css/theme.css?v=10">
+  <link rel="stylesheet" href="/css/pulido.css?v=1">
+</head>
+<body>
+
+  <div id="login" class="pantalla-login">
+    <section class="login-marca">
+      <img src="/img/logo.png" alt="Panel de control TI" width="104" height="104">
+      <h1>Panel de<br>control <em>TI</em></h1>
+      <span class="firma">Gestión de activos de TI</span>
+    </section>
+    <div class="login-lado">
+      <form class="caja-login" id="form-login">
+        <img src="/img/logo.png" alt="Panel de control TI" width="72" height="72">
+        <h2>Iniciar sesión</h2>
+        <p class="sub">Panel de control TI</p>
+        <div id="error-login"></div>
+        <div class="campo">
+          <label for="usuario">Usuario</label>
+          <input id="usuario" name="usuario" autocomplete="username" required autofocus>
+        </div>
+        <div class="campo">
+          <label for="password">Contraseña</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <button type="submit" class="btn-primario" style="width:100%">Entrar</button>
+      </form>
+    </div>
+  </div>
+
+  <div id="app" hidden>
+    <div class="velo-menu" id="velo-menu"></div>
+    <aside class="sidebar" id="sidebar">
+      <div class="marca">
+        <img src="/img/logo.png" alt="Panel de control TI" width="40" height="40">
+        <div class="marca-texto">
+          <h1>Panel de control TI</h1>
+          <span>Gestión de activos de TI</span>
+        </div>
+      </div>
+      <div class="tarjeta-usuario">
+        <div class="avatar" id="avatar-menu"></div>
+        <div class="datos">
+          <b id="sesion-nombre"></b>
+          <span class="en-linea" id="sesion-rol"></span>
+        </div>
+      </div>
+      <nav class="nav" id="nav">
+        <div class="nav-grupo">Principal</div>
+        <button data-vista="tablero"><i data-icono="tablero"></i><span>Tablero</span></button>
+
+        <div class="nav-grupo">Inventario</div>
+        <button data-vista="empleados"><i data-icono="empleados"></i><span>Empleados</span></button>
+        <button data-vista="equipos"><i data-icono="equipos"></i><span>Equipos de cómputo</span></button>
+        <button data-vista="tabletas"><i data-icono="tabletas"></i><span>Tablets</span></button>
+        <button data-vista="telefonia"><i data-icono="telefonia"></i><span>Telefonía</span></button>
+        <button data-vista="impresoras"><i data-icono="impresoras"></i><span>Impresoras</span></button>
+
+        <div class="nav-grupo">Servicios</div>
+        <button data-vista="licencias"><i data-icono="licencias"></i><span>Licencias</span></button>
+        <button data-vista="correos"><i data-icono="correos"></i><span>Correos</span></button>
+
+        <div class="nav-grupo">Control</div>
+        <button data-vista="auditorias"><i data-icono="auditorias"></i><span>Auditoría</span></button>
+        <button data-vista="verificacion"><i data-icono="verificacion"></i><span>Verificación de números</span></button>
+        <button data-vista="notificaciones"><i data-icono="notificaciones"></i><span>Notificaciones</span><span class="contador" id="cont-notif" hidden>0</span></button>
+        <button data-vista="notas"><i data-icono="notas"></i><span>Notas</span><span class="contador" id="cont-notas" hidden>0</span></button>
+        <button data-vista="alertas"><i data-icono="alertas"></i><span>Alertas</span><span class="contador" id="cont-alertas" hidden>0</span></button>
+
+        <div class="nav-grupo">Administración</div>
+        <button data-vista="reportes"><i data-icono="reportes"></i><span>Reportes</span></button>
+        <button data-vista="catalogos"><i data-icono="catalogos"></i><span>Catálogos</span></button>
+        <button data-vista="contrasenas" id="nav-contrasenas" hidden><i data-icono="contrasenas"></i><span>Contraseñas</span></button>
+        <button data-vista="usuarios" id="nav-usuarios" hidden><i data-icono="usuarios"></i><span>Personal de TI</span></button>
+        <button data-vista="bitacora"><i data-icono="bitacora"></i><span>Bitácora</span></button>
+      </nav>
+    </aside>
+
+    <div class="contenedor">
+      <header class="barra-superior">
+        <button class="btn-icono" id="btn-menu" aria-label="Menú" aria-expanded="false"><i data-icono="menu"></i></button>
+        <div class="titulo-barra">
+          <b id="barra-titulo">Tablero</b>
+          <span class="migas" id="barra-migas">Panel / Tablero</span>
+        </div>
+
+        <div class="buscador-global" id="buscador">
+          <i data-icono="buscar"></i>
+          <input id="busqueda-global" type="search" autocomplete="off"
+                 placeholder="Buscar personas, equipos, líneas, correos…" aria-label="Buscar">
+          <kbd>/</kbd>
+          <div class="flotante resultados-busqueda" id="resultados-busqueda" hidden></div>
+        </div>
+
+        <div class="acciones-barra">
+          <div class="ancla">
+            <button class="btn-icono" id="btn-tema" aria-label="Tema de color"><i data-icono="tema"></i></button>
+            <div class="flotante" id="menu-tema" hidden></div>
+          </div>
+          <div class="ancla">
+            <button class="btn-icono" id="btn-campana" aria-label="Avisos">
+              <i data-icono="campana"></i>
+              <span class="insignia-campana" id="cont-campana" hidden>0</span>
+            </button>
+            <div class="flotante" id="menu-campana" hidden></div>
+          </div>
+          <div class="ancla">
+            <button class="chip-usuario" id="btn-usuario" aria-label="Cuenta">
+              <span class="avatar" id="avatar-barra"></span>
+              <span id="nombre-barra"></span>
+              <i data-icono="abajo"></i>
+            </button>
+            <div class="flotante" id="menu-usuario" hidden>
+              <div class="cabecera-menu">
+                <span class="avatar" id="avatar-menu-usuario"></span>
+                <div><b id="nombre-menu-usuario"></b><small id="rol-menu-usuario"></small></div>
+              </div>
+              <div class="separador"></div>
+              <button class="opcion" id="btn-mi-perfil"><i data-icono="usuarios"></i>Mi perfil</button>
+              <button class="opcion" id="btn-mi-password"><i data-icono="llave"></i>Cambiar contraseña</button>
+              <button class="opcion" id="btn-salir"><i data-icono="salir"></i>Cerrar sesión</button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main id="vista"></main>
+    </div>
+  </div>
+
+  <div id="modal"></div>
+  <div id="visor"></div>
+  <div id="toasts"></div>
+
+  <script src="/js/app.js?v=11"></script>
+</body>
+</html>
