@@ -1332,3 +1332,695 @@ def eliminar_empleado(
     return {"ok": True}
 
 
+# --------------------------------------------------------------------------
+# Activos
+# --------------------------------------------------------------------------
+
+
+def _aplicar_detalle(db: Session, activo: Activo, datos: schemas.ActivoIn) -> None:
+    """Crea o actualiza las tablas de detalle que corresponden al tipo.
+
+    La tableta lleva SIM y también es equipo de cómputo: usa ambas.
+    """
+    if datos.tipo in (TipoActivo.COMPUTO, TipoActivo.TABLETA) and datos.computo:
+        destino = activo.detalle_computo or DetalleComputo(activo_id=activo.id)
+        for campo, valor in datos.computo.model_dump().items():
+            setattr(destino, campo, valor)
+        activo.detalle_computo = destino
+
+    if datos.tipo in (TipoActivo.TELEFONO, TipoActivo.TABLETA) and datos.movil:
+        destino = activo.detalle_movil or DetalleMovil(activo_id=activo.id)
+        for campo, valor in datos.movil.model_dump().items():
+            setattr(destino, campo, valor)
+        if datos.tipo == TipoActivo.TELEFONO:
+            destino.operador = OPERADOR_TELEFONIA
+            destino.esquema = ESQUEMA_TELEFONIA
+        activo.detalle_movil = destino
+
+    if (
+        datos.tipo in (TipoActivo.LICENCIA_MICROSOFT, TipoActivo.LICENCIA_NORTON)
+        and datos.licencia
+    ):
+        cuenta_nueva = datos.licencia.cuenta_id
+        if cuenta_nueva and (
+            activo.detalle_licencia is None or activo.detalle_licencia.cuenta_id != cuenta_nueva
+        ):
+            validar_cupo_familia(db, activo, datos.tipo, cuenta_nueva)
+        destino = activo.detalle_licencia or DetalleLicencia(activo_id=activo.id)
+        for campo, valor in datos.licencia.model_dump().items():
+            setattr(destino, campo, valor)
+        activo.detalle_licencia = destino
+
+    elif datos.tipo == TipoActivo.CORREO_WORKSPACE and datos.correo:
+        destino = activo.detalle_correo or DetalleCorreo(activo_id=activo.id)
+        for campo, valor in datos.correo.model_dump().items():
+            setattr(destino, campo, valor)
+        activo.detalle_correo = destino
+
+
+def _crear_activo(db: Session, datos: schemas.ActivoIn) -> Activo:
+    if datos.tipo in TIPOS_SIN_VENCIMIENTO:
+        datos.fecha_vencimiento = None
+    if datos.tipo in TIPOS_LICENCIA:
+        datos.fecha_adquisicion = None
+    activo = Activo(
+        codigo=datos.codigo.strip().upper() if datos.codigo else siguiente_codigo(db, datos.tipo),
+        tipo=datos.tipo,
+        estatus=datos.estatus,
+        descripcion=datos.descripcion,
+        fecha_adquisicion=datos.fecha_adquisicion,
+        fecha_vencimiento=datos.fecha_vencimiento,
+        notas=datos.notas,
+    )
+    db.add(activo)
+    db.flush()
+    _aplicar_detalle(db, activo, datos)
+    db.flush()
+    return activo
+
+
+def _normalizar_documentos(datos, tipo: TipoActivo) -> None:
+    """Deja en NO_APLICA los documentos que el tipo de activo no requiere."""
+    if tipo not in TIPOS_CON_RESPONSIVA:
+        datos.responsiva_estado = EstadoDocumento.NO_APLICA
+        datos.responsiva_fecha_envio = None
+        datos.responsiva_fecha_firma = None
+        datos.responsiva_destino = None
+        datos.responsiva_url = None
+        datos.responsiva_archivo = None
+        datos.responsiva_nombre = None
+    if tipo not in TIPOS_CON_INE:
+        datos.ine_estado = EstadoDocumento.NO_APLICA
+        datos.ine_url = None
+        datos.ine_archivo = None
+        datos.ine_nombre = None
+
+
+def _mensaje_duplicado(exc: IntegrityError) -> str:
+    texto = str(exc.orig)
+    for campo, etiqueta in (
+        ("numero_serie", "el número de serie"),
+        ("imei", "el IMEI"),
+        ("numero_telefonico", "el número telefónico"),
+        ("iccid", "el ICCID"),
+        ("direccion", "la dirección de correo"),
+        ("codigo", "el código"),
+    ):
+        if campo in texto:
+            return f"{etiqueta} ya está registrado en otro activo"
+    return "ya existe un registro con ese valor"
+
+
+@app.get("/api/activos")
+def listar_activos(
+    q: str | None = Query(None, max_length=100),
+    tipo: TipoActivo | None = None,
+    grupo: str | None = None,
+    estatus: EstatusActivo | None = None,
+    cuenta_id: int | None = None,
+    sin_asignar: bool = False,
+    sucursal_id: int | None = None,
+    departamento_id: int | None = None,
+    bodega_id: int | None = None,
+    planta_id: int | None = None,
+    db: Session = Depends(obtener_sesion),
+    _=Depends(usuario_actual),
+):
+    consulta = db.query(Activo)
+    if grupo:
+        if grupo not in GRUPOS:
+            raise HTTPException(400, "Grupo desconocido")
+        consulta = consulta.filter(Activo.tipo.in_(GRUPOS[grupo]))
+    if tipo:
+        consulta = consulta.filter(Activo.tipo == tipo)
+    if estatus:
+        consulta = consulta.filter(Activo.estatus == estatus)
+    if cuenta_id:
+        consulta = consulta.join(DetalleLicencia).filter(DetalleLicencia.cuenta_id == cuenta_id)
+    ubicacion = filtro_ubicacion(sucursal_id, departamento_id, bodega_id, planta_id)
+    if ubicacion:
+        # Los activos no tienen ubicación propia: se filtran por la persona que los tiene
+        consulta = consulta.filter(
+            Activo.id.in_(
+                db.query(Asignacion.activo_id)
+                .join(Empleado, Empleado.id == Asignacion.empleado_id)
+                .filter(Asignacion.fecha_devolucion.is_(None), *ubicacion)
+            )
+        )
+    if q:
+        patron = patron_busqueda(q)
+        consulta = (
+            consulta.outerjoin(DetalleComputo)
+            .outerjoin(DetalleMovil)
+            .outerjoin(DetalleCorreo)
+            .outerjoin(DetalleLicencia)
+            .filter(
+                or_(
+                    func.upper(Activo.codigo).like(patron, escape="\\"),
+                    func.upper(Activo.descripcion).like(patron, escape="\\"),
+                    func.upper(DetalleComputo.numero_serie).like(patron, escape="\\"),
+                    func.upper(DetalleMovil.imei).like(patron, escape="\\"),
+                    func.upper(DetalleMovil.numero_telefonico).like(patron, escape="\\"),
+                    func.upper(DetalleCorreo.direccion).like(patron, escape="\\"),
+                    func.upper(DetalleLicencia.correo_licencia).like(patron, escape="\\"),
+                    func.upper(DetalleLicencia.identificador_dispositivo).like(patron, escape="\\"),
+                )
+            )
+        )
+
+    # Los detalles y las asignaciones se traen por lotes: una consulta por tabla, no por activo
+    activos = (
+        consulta.options(
+            selectinload(Activo.detalle_computo),
+            selectinload(Activo.detalle_movil),
+            selectinload(Activo.detalle_licencia).selectinload(DetalleLicencia.cuenta),
+            selectinload(Activo.detalle_correo),
+        )
+        .order_by(Activo.codigo)
+        .all()
+    )
+    vigentes = asignaciones_vigentes(db, [a.id for a in activos])
+    salida = [dic_activo(a, db, vigentes) for a in activos]
+    if sin_asignar:
+        salida = [a for a in salida if a["asignado_a"] is None]
+    return salida
+
+
+@app.get("/api/activos/exportar")
+def exportar_activos(
+    request: Request,
+    grupo: str,
+    q: str | None = Query(None, max_length=100),
+    tipo: TipoActivo | None = None,
+    estatus: EstatusActivo | None = None,
+    sin_asignar: bool = False,
+    sucursal_id: int | None = None,
+    departamento_id: int | None = None,
+    bodega_id: int | None = None,
+    planta_id: int | None = None,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(usuario_actual),
+):
+    if grupo not in ("equipos", "tabletas", "telefonia"):
+        raise HTTPException(400, "Grupo desconocido")
+    activos = listar_activos(
+        q, tipo, grupo, estatus, None, sin_asignar,
+        sucursal_id, departamento_id, bodega_id, planta_id, db, usuario,
+    )
+    empleados = {
+        e.id: e
+        for e in db.query(Empleado).filter(
+            Empleado.id.in_([a["asignado_a"]["empleado_id"] for a in activos if a["asignado_a"]])
+        )
+    }
+
+    def asignacion(a: dict) -> list:
+        vig = a["asignado_a"]
+        emp = empleados.get(vig["empleado_id"]) if vig else None
+        return [
+            vig["empleado"] if vig else "",
+            vig["codigo_empleado"] if vig else "",
+            emp.departamento.nombre if emp and emp.departamento else "",
+            emp.sucursal.nombre if emp and emp.sucursal else "",
+            vig["fecha_asignacion"] if vig else None,
+        ]
+
+    def responsiva(a: dict) -> list:
+        vig = a["asignado_a"]
+        if not vig:
+            return ["", None, "", None, ""]
+        return [
+            ESTADO_DOC_TEXTO[vig["responsiva_estado"]],
+            vig["responsiva_fecha_envio"],
+            vig["responsiva_destino"],
+            vig["responsiva_fecha_firma"],
+            _enlace_documento(request, vig, "responsiva"),
+        ]
+
+    columnas_asignacion = ["Asignado a", "Código empleado", "Departamento", "Sucursal", "Asignado desde"]
+    columnas_responsiva = ["Responsiva", "Enviada a firmar", "Enviada a", "Firmada el", "Documento responsiva"]
+
+    if grupo == "telefonia":
+        filas = []
+        for a in activos:
+            m = a.get("movil") or {}
+            vig = a["asignado_a"]
+            filas.append(
+                [
+                    a["codigo"], m.get("marca"), m.get("modelo"), m.get("numero_telefonico"),
+                    m.get("imei"), m.get("iccid"), m.get("operador"), m.get("precio_plan"),
+                    m.get("esquema"), "Sí" if m.get("esim") else "No", m.get("cuenta_operador"),
+                    a["estatus"], *asignacion(a), *responsiva(a),
+                    ESTADO_DOC_TEXTO[vig["ine_estado"]] if vig else "",
+                    _enlace_documento(request, vig, "ine"), a["notas"],
+                ]
+            )
+        return _descarga_excel(
+            "Telefonía",
+            ["Código", "Marca", "Modelo", "Teléfono", "IMEI", "ICCID", "Operador", "Plan",
+             "Esquema", "eSIM", "Cuenta operador", "Estatus", *columnas_asignacion,
+             *columnas_responsiva, "INE", "Documento INE", "Notas"],
+            filas,
+            [12, 14, 22, 14, 18, 22, 12, 10, 16, 7, 16, 13, 30, 14, 20, 16, 13,
+             20, 14, 20, 13, 30, 20, 30, 30],
+            "telefonia",
+        )
+
+    filas = []
+    for a in activos:
+        c = a.get("computo") or {}
+        filas.append(
+            [
+                a["codigo"], c.get("marca"), c.get("modelo"), c.get("numero_serie"),
+                c.get("procesador"), c.get("ram_gb"), c.get("almacenamiento"),
+                c.get("sistema_operativo"), a["fecha_adquisicion"], a["estatus"],
+                *asignacion(a), *responsiva(a), a["notas"],
+            ]
+        )
+    return _descarga_excel(
+        "Tablets" if grupo == "tabletas" else "Equipos de cómputo",
+        ["Código", "Marca", "Modelo", "Número de serie", "Procesador", "RAM (GB)",
+         "Almacenamiento", "Sistema operativo", "Fecha de adquisición", "Estatus",
+         *columnas_asignacion, *columnas_responsiva, "Notas"],
+        filas,
+        [12, 14, 22, 20, 26, 9, 15, 18, 14, 13, 30, 14, 20, 16, 13, 20, 14, 20, 13, 30, 30],
+        grupo,
+    )
+
+
+@app.get("/api/activos/{activo_id}")
+def ver_activo(activo_id: int, db: Session = Depends(obtener_sesion), _=Depends(usuario_actual)):
+    activo = db.get(Activo, activo_id)
+    if activo is None:
+        raise HTTPException(404, "Activo no encontrado")
+    datos = dic_activo(activo, db)
+    datos["historial"] = [
+        dic_asignacion(a)
+        for a in db.query(Asignacion)
+        .filter(Asignacion.activo_id == activo_id)
+        .order_by(Asignacion.fecha_asignacion.desc())
+        .all()
+    ]
+    return datos
+
+
+@app.post("/api/activos")
+@un_alta_a_la_vez
+def crear_activo(
+    datos: schemas.ActivoIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    try:
+        activo = _crear_activo(db, datos)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, f"Dato duplicado: {_mensaje_duplicado(exc)}")
+    registrar(db, usuario, "CREAR", "activo", activo.id, activo.codigo)
+    db.commit()
+    return dic_activo(activo, db)
+
+
+@app.put("/api/activos/{activo_id}")
+def editar_activo(
+    activo_id: int,
+    datos: schemas.ActivoIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    activo = db.get(Activo, activo_id)
+    if activo is None:
+        raise HTTPException(404, "Activo no encontrado")
+
+    activo.estatus = datos.estatus
+    activo.descripcion = datos.descripcion
+    activo.fecha_adquisicion = None if activo.tipo in TIPOS_LICENCIA else datos.fecha_adquisicion
+    activo.fecha_vencimiento = (
+        None if activo.tipo in TIPOS_SIN_VENCIMIENTO else datos.fecha_vencimiento
+    )
+    activo.notas = datos.notas
+    if datos.codigo:
+        activo.codigo = datos.codigo.strip().upper()
+
+    try:
+        _aplicar_detalle(db, activo, datos)
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, f"Dato duplicado: {_mensaje_duplicado(exc)}")
+    registrar(db, usuario, "EDITAR", "activo", activo.id, activo.codigo)
+    db.commit()
+    return dic_activo(activo, db)
+
+
+@app.delete("/api/activos/{activo_id}")
+def eliminar_activo(
+    activo_id: int,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    activo = db.get(Activo, activo_id)
+    if activo is None:
+        raise HTTPException(404, "Activo no encontrado")
+
+    codigo = activo.codigo
+    # Se borra también su historial de asignaciones: la interfaz avisa antes.
+    db.query(Asignacion).filter(Asignacion.activo_id == activo_id).delete()
+    db.delete(activo)
+    registrar(db, usuario, "ELIMINAR", "activo", activo_id, codigo)
+    db.commit()
+    return {"ok": True}
+
+
+COLUMNAS_REPORTE_CORREO = {
+    "direccion": "email address",
+    "ultimo_acceso": "last sign in",
+    "almacenamiento": "email usage",
+}
+# Columnas C, E y F del reporte de Google Workspace
+POSICION_REPORTE_CORREO = {"direccion": 2, "ultimo_acceso": 4, "almacenamiento": 5}
+UNIDADES_GB = {"KB": 1 / 1024**2, "MB": 1 / 1024, "GB": 1, "TB": 1024}
+
+
+def _leer_ultimo_acceso(valor) -> tuple[bool, dt.datetime | None]:
+    """(se pudo leer, fecha). Las cuentas que nunca han entrado dan (True, None)."""
+    if isinstance(valor, dt.datetime):
+        return True, valor
+    texto = str(valor or "").strip()
+    if not texto or texto.lower().startswith("never"):
+        return True, None
+    for formato in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%Y/%m/%d", "%Y-%m-%d"):
+        try:
+            return True, dt.datetime.strptime(texto, formato)
+        except ValueError:
+            pass
+    return False, None
+
+
+def _leer_almacenamiento(valor) -> float | None:
+    if isinstance(valor, (int, float)):
+        return float(valor)
+    coincidencia = re.match(r"^\s*([\d.,]+)\s*([KMGT]B)?\s*$", str(valor or ""), re.IGNORECASE)
+    if not coincidencia:
+        return None
+    numero = float(coincidencia.group(1).replace(",", ""))
+    return round(numero * UNIDADES_GB[(coincidencia.group(2) or "GB").upper()], 2)
+
+
+@app.post("/api/correos/importar-actividad")
+async def importar_actividad_correos(
+    archivo: UploadFile = File(...),
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    """Carga el reporte de usuarios de Google Workspace: último acceso y almacenamiento."""
+    from openpyxl import load_workbook
+
+    if Path(archivo.filename or "").suffix.lower() != ".xlsx":
+        raise HTTPException(400, "El reporte debe ser un archivo .xlsx")
+    contenido = await archivo.read()
+    if len(contenido) > TAMANO_MAXIMO:
+        raise HTTPException(400, "El archivo supera los 10 MB")
+    try:
+        libro = load_workbook(io.BytesIO(contenido), read_only=True, data_only=True)
+    except Exception:
+        raise HTTPException(400, "No se pudo leer el archivo de Excel")
+
+    filas = libro.active.iter_rows(values_only=True)
+    encabezado = [str(c or "").strip().lower() for c in next(filas, [])]
+    indices = {}
+    for clave, prefijo in COLUMNAS_REPORTE_CORREO.items():
+        indice = next((i for i, c in enumerate(encabezado) if c.startswith(prefijo)), None)
+        indices[clave] = POSICION_REPORTE_CORREO[clave] if indice is None else indice
+
+    cuentas = {d.direccion.strip().lower(): d for d in db.query(DetalleCorreo).all()}
+    momento = dt.datetime.now(dt.timezone.utc)
+    actualizados = 0
+    no_registrados: list[str] = []
+    inactivos_no_registrados: list[dict] = []
+    ahora = ahora_local()
+    for fila in filas:
+        if not fila or len(fila) <= max(indices.values()):
+            continue
+        direccion = str(fila[indices["direccion"]] or "").strip().lower()
+        if not direccion:
+            continue
+        leido, ultimo = _leer_ultimo_acceso(fila[indices["ultimo_acceso"]])
+        cuenta = cuentas.get(direccion)
+        if cuenta is None:
+            no_registrados.append(direccion)
+            dias = (ahora - ultimo).days if ultimo else None
+            if leido and (dias is None or dias >= DIAS_DESUSO_CORREO):
+                inactivos_no_registrados.append(
+                    {
+                        "direccion": direccion,
+                        "ultimo_acceso": ultimo,
+                        "dias_sin_acceso": dias,
+                        "almacenamiento_gb": _leer_almacenamiento(fila[indices["almacenamiento"]]),
+                    }
+                )
+            continue
+        if leido:
+            cuenta.ultimo_acceso = ultimo
+        almacenamiento = _leer_almacenamiento(fila[indices["almacenamiento"]])
+        if almacenamiento is not None:
+            cuenta.almacenamiento_gb = almacenamiento
+        cuenta.actividad_importada_en = momento
+        actualizados += 1
+    libro.close()
+
+    registrar(
+        db, usuario, "EDITAR", "correos", None,
+        f"actividad importada de {archivo.filename}: {actualizados} cuenta(s)",
+    )
+    db.commit()
+    return {
+        "actualizados": actualizados,
+        "no_registrados": sorted(no_registrados),
+        "inactivos_no_registrados": sorted(
+            inactivos_no_registrados,
+            key=lambda c: -1 if c["dias_sin_acceso"] is None else -c["dias_sin_acceso"],
+        ),
+        "en_desuso": sum(1 for d in cuentas.values() if correo_en_desuso(d)),
+    }
+
+
+@app.post("/api/altas/equipo")
+@un_alta_a_la_vez
+def alta_equipo(
+    datos: schemas.AltaEquipoIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    """Da de alta una PC o una tableta y, opcionalmente, su correo y sus licencias.
+
+    Todo se asigna al mismo empleado. Cada pieza queda como activo propio,
+    editable y dable de baja por separado.
+    """
+    if datos.equipo.tipo not in (TipoActivo.COMPUTO, TipoActivo.TABLETA):
+        raise HTTPException(400, "Esta alta es sólo para equipos de cómputo y tabletas")
+
+    empleado = None
+    if datos.empleado_id:
+        empleado = db.get(Empleado, datos.empleado_id)
+        if empleado is None:
+            raise HTTPException(404, "Empleado no encontrado")
+        if empleado.estatus == EstatusEmpleado.BAJA:
+            raise HTTPException(409, "No se puede asignar a un empleado dado de baja")
+
+    creados: list[Activo] = []
+    try:
+        creados.append(_crear_activo(db, datos.equipo))
+
+        comunes = {"estatus": EstatusActivo.DISPONIBLE}
+
+        if datos.correo and datos.correo.direccion:
+            creados.append(
+                _crear_activo(
+                    db,
+                    schemas.ActivoIn(
+                        tipo=TipoActivo.CORREO_WORKSPACE,
+                        descripcion=datos.correo.direccion,
+                        correo=datos.correo,
+                        **comunes,
+                    ),
+                )
+            )
+
+        for licencia, tipo, etiqueta in (
+            (datos.licencia_microsoft, TipoActivo.LICENCIA_MICROSOFT, "Microsoft 365"),
+            (datos.licencia_norton, TipoActivo.LICENCIA_NORTON, "Norton 360"),
+        ):
+            if licencia and (
+                licencia.cuenta_id
+                or licencia.correo_licencia
+                or licencia.identificador_dispositivo
+            ):
+                creados.append(
+                    _crear_activo(
+                        db,
+                        schemas.ActivoIn(
+                            tipo=tipo,
+                            descripcion=licencia.correo_licencia or etiqueta,
+                            licencia=licencia,
+                            **comunes,
+                        ),
+                    )
+                )
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, f"Dato duplicado: {_mensaje_duplicado(exc)}")
+
+    asignados = 0
+    if empleado:
+        for activo in creados:
+            lleva = activo.tipo in TIPOS_CON_RESPONSIVA
+            lleva_ine = activo.tipo in TIPOS_CON_INE
+            db.add(
+                Asignacion(
+                    activo_id=activo.id,
+                    empleado_id=empleado.id,
+                    fecha_asignacion=datos.fecha_asignacion or hoy_local(),
+                    responsiva_estado=datos.responsiva_estado
+                    if lleva
+                    else EstadoDocumento.NO_APLICA,
+                    responsiva_fecha_envio=datos.responsiva_fecha_envio if lleva else None,
+                    responsiva_fecha_firma=datos.responsiva_fecha_firma if lleva else None,
+                    responsiva_destino=datos.responsiva_destino if lleva else None,
+                    responsiva_url=datos.responsiva_url if lleva else None,
+                    responsiva_archivo=datos.responsiva_archivo if lleva else None,
+                    responsiva_nombre=datos.responsiva_nombre if lleva else None,
+                    ine_estado=datos.ine_estado if lleva_ine else EstadoDocumento.NO_APLICA,
+                    ine_url=datos.ine_url if lleva_ine else None,
+                    ine_archivo=datos.ine_archivo if lleva_ine else None,
+                    ine_nombre=datos.ine_nombre if lleva_ine else None,
+                )
+            )
+            activo.estatus = EstatusActivo.ASIGNADO
+            asignados += 1
+        db.flush()
+
+    registrar(
+        db,
+        usuario,
+        "CREAR",
+        "alta_equipo",
+        creados[0].id,
+        f"{', '.join(a.codigo for a in creados)}"
+        + (f" → {empleado.nombre_completo}" if empleado else ""),
+    )
+    db.commit()
+    return {
+        "creados": [dic_activo(a, db) for a in creados],
+        "asignados": asignados,
+    }
+
+
+# --------------------------------------------------------------------------
+# Asignaciones
+# --------------------------------------------------------------------------
+
+
+@app.post("/api/asignaciones")
+def asignar(
+    datos: schemas.AsignacionIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    activo = db.get(Activo, datos.activo_id)
+    empleado = db.get(Empleado, datos.empleado_id)
+    if activo is None:
+        raise HTTPException(404, "Activo no encontrado")
+    if empleado is None:
+        raise HTTPException(404, "Empleado no encontrado")
+    if asignacion_vigente(db, activo.id):
+        raise HTTPException(
+            409, f"{activo.codigo} ya está asignado. Regístralo como devuelto primero."
+        )
+    if empleado.estatus == EstatusEmpleado.BAJA:
+        raise HTTPException(409, "No se puede asignar a un empleado dado de baja")
+
+    _normalizar_documentos(datos, activo.tipo)
+    asignacion = Asignacion(
+        activo_id=datos.activo_id,
+        empleado_id=datos.empleado_id,
+        fecha_asignacion=datos.fecha_asignacion or hoy_local(),
+        responsiva_estado=datos.responsiva_estado,
+        responsiva_fecha_envio=datos.responsiva_fecha_envio,
+        responsiva_fecha_firma=datos.responsiva_fecha_firma,
+        responsiva_destino=datos.responsiva_destino,
+        responsiva_url=datos.responsiva_url,
+        responsiva_archivo=datos.responsiva_archivo,
+        responsiva_nombre=datos.responsiva_nombre,
+        ine_estado=datos.ine_estado,
+        ine_url=datos.ine_url,
+        ine_archivo=datos.ine_archivo,
+        ine_nombre=datos.ine_nombre,
+        notas=datos.notas,
+    )
+    db.add(asignacion)
+    activo.estatus = EstatusActivo.ASIGNADO
+    db.flush()
+    registrar(
+        db,
+        usuario,
+        "ASIGNAR",
+        "asignacion",
+        asignacion.id,
+        f"{activo.codigo} → {empleado.nombre_completo}",
+    )
+    db.commit()
+    return dic_asignacion(asignacion)
+
+
+@app.put("/api/asignaciones/{asignacion_id}")
+def editar_asignacion(
+    asignacion_id: int,
+    datos: schemas.AsignacionEditarIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    asignacion = db.get(Asignacion, asignacion_id)
+    if asignacion is None:
+        raise HTTPException(404, "Asignación no encontrada")
+    _normalizar_documentos(datos, asignacion.activo.tipo)
+    for campo, valor in datos.model_dump().items():
+        setattr(asignacion, campo, valor)
+    registrar(
+        db, usuario, "EDITAR", "asignacion", asignacion.id, f"documentación de {asignacion.activo.codigo}"
+    )
+    db.commit()
+    return dic_asignacion(asignacion)
+
+
+@app.post("/api/asignaciones/{asignacion_id}/devolver")
+def devolver(
+    asignacion_id: int,
+    datos: schemas.DevolucionIn,
+    db: Session = Depends(obtener_sesion),
+    usuario: Usuario = Depends(requiere_captura),
+):
+    asignacion = db.get(Asignacion, asignacion_id)
+    if asignacion is None:
+        raise HTTPException(404, "Asignación no encontrada")
+    if asignacion.fecha_devolucion is not None:
+        raise HTTPException(409, "Esta asignación ya fue cerrada")
+
+    asignacion.fecha_devolucion = datos.fecha_devolucion or hoy_local()
+    asignacion.motivo_devolucion = datos.motivo_devolucion
+    if datos.notas:
+        asignacion.notas = f"{asignacion.notas or ''}\n{datos.notas}".strip()
+    asignacion.activo.estatus = datos.nuevo_estatus_activo
+
+    registrar(
+        db,
+        usuario,
+        "DEVOLVER",
+        "asignacion",
+        asignacion.id,
+        f"{asignacion.activo.codigo} ← {asignacion.empleado.nombre_completo}",
+    )
+    db.commit()
+    return dic_asignacion(asignacion)
+
+
